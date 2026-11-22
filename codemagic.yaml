@@ -33,7 +33,7 @@ definitions:
       source "$CM_BUILD_DIR/.venv/bin/activate"
       pip install --no-cache-dir --upgrade pip
       pip install --no-cache-dir \
-        lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow \
+        uv lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow \
         requests gdown "backports.zstd; python_version < '3.14'"
 
   script_clone_and_download: &script_clone_and_download
@@ -43,53 +43,31 @@ definitions:
       source "$CM_BUILD_DIR/.venv/bin/activate"
 
       git clone --depth 1 https://github.com/sacoc96/NX2Apple-FC27.git "$CM_BUILD_DIR/NX2Apple-FC27"
+      git clone --depth 1 https://github.com/ltsdw/gofile-downloader.git "$CM_BUILD_DIR/gf_dl"
       find "$CM_BUILD_DIR/NX2Apple-FC27" -name "*.sh" -exec chmod +x {} + || true
 
       GAME_DIR="$CM_BUILD_DIR/game_nsp"
       KEYS_DIR="$CM_BUILD_DIR/keys"
       mkdir -p "$GAME_DIR" "$KEYS_DIR"
 
-      cat << 'EOF' > /tmp/dl.py
-      import os, sys, subprocess, requests
-
-      url, out_dir = sys.argv[1], sys.argv[2]
-      os.makedirs(out_dir, exist_ok=True)
-
-      def download_direct(u, dest):
-          with requests.get(u, stream=True, timeout=60) as r:
-              r.raise_for_status()
-              with open(dest, "wb") as f:
-                  for chunk in r.iter_content(chunk_size=1024 * 1024):
-                      if chunk:
-                          f.write(chunk)
-
-      if "drive.google.com" in url:
-          subprocess.run(["gdown", url, "-O", out_dir + "/"], check=True)
-      elif "gofile.io/d/" in url:
-          content_id = url.rstrip("/").split("/d/")[-1].split("?")[0]
-          acc = requests.post("https://api.gofile.io/accounts", timeout=30).json()
-          token = acc["data"]["token"]
-          headers = {"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0"}
-          info = requests.get(f"https://api.gofile.io/contents/{content_id}?wt=4fd6sg89d7s6", headers=headers, timeout=30).json()
-          children = info.get("data", {}).get("children", {})
-          if not children:
-              raise RuntimeError(f"No files found in Gofile folder: {info}")
-          for child in children.values():
-              if child.get("type") == "file":
-                  name = child["name"]
-                  link = child["link"]
-                  dest = os.path.join(out_dir, name)
-                  print(f"Downloading Gofile: {name}")
-                  with requests.get(link, headers={"Cookie": f"accountToken={token}"}, stream=True, timeout=60) as r:
-                      r.raise_for_status()
-                      with open(dest, "wb") as f:
-                          for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                              if chunk:
-                                  f.write(chunk)
-      else:
-          fname = url.split("?")[0].rstrip("/").split("/")[-1] or "downloaded_file"
-          download_direct(url, os.path.join(out_dir, fname))
-      EOF
+      download_url() {
+        local url="$1"
+        local out_dir="$2"
+        mkdir -p "$out_dir"
+        if [[ "$url" == *"gofile.io/d/"* ]]; then
+          echo "Downloading from Gofile via gofile-downloader.py..."
+          (cd "$CM_BUILD_DIR/gf_dl" && GF_DOWNLOAD_DIR="$out_dir" uv run gofile-downloader.py "$url")
+        elif [[ "$url" == *"drive.google.com"* ]]; then
+          echo "Downloading from Google Drive via gdown..."
+          gdown "$url" -O "$out_dir/"
+        else
+          echo "Downloading direct URL..."
+          local fname
+          fname=$(basename "${url%%\?*}")
+          [ -n "$fname" ] || fname="downloaded_file"
+          curl -fL --retry 3 "$url" -o "$out_dir/$fname"
+        fi
+      }
 
       if [ -z "${BASE_URL:-}" ] || [ -z "${UPDATE_URL:-}" ] || [ -z "${KEYS_URL:-}" ]; then
         echo "ERROR: BASE_URL, UPDATE_URL, and KEYS_URL must be set in group fc27_secrets."
@@ -97,25 +75,28 @@ definitions:
       fi
 
       echo "Downloading Base NSP..."
-      python3 /tmp/dl.py "$BASE_URL" "$GAME_DIR"
+      download_url "$BASE_URL" "$GAME_DIR"
       echo "Downloading Update v393216 (1.8d.310c)..."
-      python3 /tmp/dl.py "$UPDATE_URL" "$GAME_DIR"
+      download_url "$UPDATE_URL" "$GAME_DIR"
       echo "Downloading prod.keys..."
-      python3 /tmp/dl.py "$KEYS_URL" "$KEYS_DIR"
+      download_url "$KEYS_URL" "$KEYS_DIR"
 
       if [ -n "${DLC_URL:-}" ]; then
         echo "Downloading optional DLC..."
-        python3 /tmp/dl.py "$DLC_URL" "$GAME_DIR"
+        download_url "$DLC_URL" "$GAME_DIR"
       fi
 
+      # Flatten subfolders created by Gofile downloader
       find "$GAME_DIR" -mindepth 2 -type f \( -iname "*.nsp" -o -iname "*.nsz" -o -iname "*.xci" \) -exec mv -f {} "$GAME_DIR/" \;
 
-      KEY_FILE=$(find "$KEYS_DIR" -type f | head -n 1)
+      KEY_FILE=$(find "$KEYS_DIR" -type f ! -name ".*" | head -n 1)
       if [ -z "$KEY_FILE" ]; then
         echo "ERROR: prod.keys not found after download!"
         exit 1
       fi
-      cp -f "$KEY_FILE" "$KEYS_DIR/prod.keys"
+      if [ "$KEY_FILE" != "$KEYS_DIR/prod.keys" ]; then
+        cp -f "$KEY_FILE" "$KEYS_DIR/prod.keys"
+      fi
 
       # Load existing nvn_capture.zip if provided (supports resuming capture or full iOS build)
       if [ -n "${CAPTURE_URL:-}" ]; then
@@ -123,7 +104,7 @@ definitions:
         CAP_TMP="$CM_BUILD_DIR/cap_tmp"
         CAP_DEST="$GAME_DIR/0100C49025D3E000_build/extract/v393216/nvn_capture"
         mkdir -p "$CAP_TMP" "$CAP_DEST"
-        python3 /tmp/dl.py "$CAPTURE_URL" "$CAP_TMP"
+        download_url "$CAPTURE_URL" "$CAP_TMP"
         CAP_ARCH=$(find "$CAP_TMP" -type f -iname "*.zip" | head -n 1 || true)
         if [ -n "$CAP_ARCH" ]; then
           unzip -qo "$CAP_ARCH" -d "$CAP_DEST"
