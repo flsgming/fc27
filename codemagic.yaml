@@ -1,0 +1,329 @@
+definitions:
+  common_env: &common_env
+    groups:
+      - fc27_secrets
+    vars:
+      # Optional language code (leave empty for English, or e.g. "it", "fr", "es")
+      GAME_LANG: ""
+    xcode: 27.0
+
+  script_cleanup: &script_cleanup
+    name: 1. Free Disk Space (Target > 160 GB)
+    script: |
+      set -euo pipefail
+      df -h /
+      rm -rf "${ANDROID_SDK_ROOT:-/usr/local/share/android-sdk}" "$HOME/Library/Android" || true
+      xcrun simctl runtime delete all || true
+      rm -rf "$HOME/Library/Caches/"* "$HOME/Library/Developer/Xcode/DerivedData/"* || true
+      brew cleanup --prune=all || true
+      df -h /
+
+  script_tools: &script_tools
+    name: 2. Install Build Tools & Python Environment
+    script: |
+      set -euo pipefail
+      brew install xcodegen zstd spirv-cross || true
+
+      curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+      chmod +x /tmp/dotnet-install.sh
+      /tmp/dotnet-install.sh --channel 10.0 --architecture arm64 --install-dir "$HOME/.dotnet"
+      /tmp/dotnet-install.sh --channel 10.0 --runtime dotnet --architecture x64 --install-dir "$HOME/.dotnet-x64"
+
+      python3 -m venv "$CM_BUILD_DIR/.venv"
+      source "$CM_BUILD_DIR/.venv/bin/activate"
+      pip install --no-cache-dir --upgrade pip
+      pip install --no-cache-dir \
+        lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow \
+        requests gdown "backports.zstd; python_version < '3.14'"
+
+  script_clone_and_download: &script_clone_and_download
+    name: 3. Clone NX2Apple-FC27 & Download Game Files
+    script: |
+      set -euo pipefail
+      source "$CM_BUILD_DIR/.venv/bin/activate"
+
+      git clone --depth 1 https://github.com/sacoc96/NX2Apple-FC27.git "$CM_BUILD_DIR/NX2Apple-FC27"
+      find "$CM_BUILD_DIR/NX2Apple-FC27" -name "*.sh" -exec chmod +x {} + || true
+
+      GAME_DIR="$CM_BUILD_DIR/game_nsp"
+      KEYS_DIR="$CM_BUILD_DIR/keys"
+      mkdir -p "$GAME_DIR" "$KEYS_DIR"
+
+      cat << 'EOF' > /tmp/dl.py
+      import os, sys, subprocess, requests
+
+      url, out_dir = sys.argv[1], sys.argv[2]
+      os.makedirs(out_dir, exist_ok=True)
+
+      def download_direct(u, dest):
+          with requests.get(u, stream=True, timeout=60) as r:
+              r.raise_for_status()
+              with open(dest, "wb") as f:
+                  for chunk in r.iter_content(chunk_size=1024 * 1024):
+                      if chunk:
+                          f.write(chunk)
+
+      if "drive.google.com" in url:
+          subprocess.run(["gdown", url, "-O", out_dir + "/"], check=True)
+      elif "gofile.io/d/" in url:
+          content_id = url.rstrip("/").split("/d/")[-1].split("?")[0]
+          acc = requests.post("https://api.gofile.io/accounts", timeout=30).json()
+          token = acc["data"]["token"]
+          headers = {"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0"}
+          info = requests.get(f"https://api.gofile.io/contents/{content_id}?wt=4fd6sg89d7s6", headers=headers, timeout=30).json()
+          children = info.get("data", {}).get("children", {})
+          if not children:
+              raise RuntimeError(f"No files found in Gofile folder: {info}")
+          for child in children.values():
+              if child.get("type") == "file":
+                  name = child["name"]
+                  link = child["link"]
+                  dest = os.path.join(out_dir, name)
+                  print(f"Downloading Gofile: {name}")
+                  with requests.get(link, headers={"Cookie": f"accountToken={token}"}, stream=True, timeout=60) as r:
+                      r.raise_for_status()
+                      with open(dest, "wb") as f:
+                          for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                              if chunk:
+                                  f.write(chunk)
+      else:
+          fname = url.split("?")[0].rstrip("/").split("/")[-1] or "downloaded_file"
+          download_direct(url, os.path.join(out_dir, fname))
+      EOF
+
+      if [ -z "${BASE_URL:-}" ] || [ -z "${UPDATE_URL:-}" ] || [ -z "${KEYS_URL:-}" ]; then
+        echo "ERROR: BASE_URL, UPDATE_URL, and KEYS_URL must be set in group fc27_secrets."
+        exit 1
+      fi
+
+      echo "Downloading Base NSP..."
+      python3 /tmp/dl.py "$BASE_URL" "$GAME_DIR"
+      echo "Downloading Update v393216 (1.8d.310c)..."
+      python3 /tmp/dl.py "$UPDATE_URL" "$GAME_DIR"
+      echo "Downloading prod.keys..."
+      python3 /tmp/dl.py "$KEYS_URL" "$KEYS_DIR"
+
+      if [ -n "${DLC_URL:-}" ]; then
+        echo "Downloading optional DLC..."
+        python3 /tmp/dl.py "$DLC_URL" "$GAME_DIR"
+      fi
+
+      find "$GAME_DIR" -mindepth 2 -type f \( -iname "*.nsp" -o -iname "*.nsz" -o -iname "*.xci" \) -exec mv -f {} "$GAME_DIR/" \;
+
+      KEY_FILE=$(find "$KEYS_DIR" -type f | head -n 1)
+      if [ -z "$KEY_FILE" ]; then
+        echo "ERROR: prod.keys not found after download!"
+        exit 1
+      fi
+      cp -f "$KEY_FILE" "$KEYS_DIR/prod.keys"
+
+      # Load existing nvn_capture.zip if provided (supports resuming capture or full iOS build)
+      if [ -n "${CAPTURE_URL:-}" ]; then
+        echo "Downloading existing nvn_capture.zip..."
+        CAP_TMP="$CM_BUILD_DIR/cap_tmp"
+        CAP_DEST="$GAME_DIR/0100C49025D3E000_build/extract/v393216/nvn_capture"
+        mkdir -p "$CAP_TMP" "$CAP_DEST"
+        python3 /tmp/dl.py "$CAPTURE_URL" "$CAP_TMP"
+        CAP_ARCH=$(find "$CAP_TMP" -type f -iname "*.zip" | head -n 1 || true)
+        if [ -n "$CAP_ARCH" ]; then
+          unzip -qo "$CAP_ARCH" -d "$CAP_DEST"
+          if [ -d "$CAP_DEST/nvn_capture" ]; then
+            mv -f "$CAP_DEST/nvn_capture/"* "$CAP_DEST/"
+            rmdir "$CAP_DEST/nvn_capture" || true
+          fi
+        fi
+        rm -rf "$CAP_TMP"
+        echo "Loaded pre-captured files: $(ls -1 "$CAP_DEST" | wc -l)"
+      fi
+
+      ls -lh "$GAME_DIR"
+      df -h /
+
+workflows:
+  # =====================================================================
+  # WORKFLOW 1: Run this FIRST with "Enable SSH/VNC access" checked!
+  # Connects via VNC Viewer to capture all 609 shaders -> uploads nvn_capture.zip to Gofile.
+  # Supports resuming if you paste a partial nvn_capture.zip link into CAPTURE_URL.
+  # =====================================================================
+  capture-fc27-vnc:
+    name: 1. FC 27 Capture 609 Shaders (VNC)
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment: *common_env
+    scripts:
+      - *script_cleanup
+      - *script_tools
+      - *script_clone_and_download
+
+      - name: 4. Prepare Mac Build & Launch Interactive Capture (Connect VNC Now!)
+        script: |
+          set -euo pipefail
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+          export DOTNET_ROOT="$HOME/.dotnet"
+          export DOTNET_ROOT_ARM64="$HOME/.dotnet"
+          export DOTNET_ROOT_X64="$HOME/.dotnet-x64"
+          export DOTNET_ROLL_FORWARD=Major
+          export PATH="$HOME/.dotnet:$PATH"
+
+          GAME_DIR="$CM_BUILD_DIR/game_nsp"
+          KEYS_FILE="$CM_BUILD_DIR/keys/prod.keys"
+          cd "$CM_BUILD_DIR/NX2Apple-FC27"
+
+          LANG_ARGS=()
+          if [ -n "${GAME_LANG:-}" ]; then
+            LANG_ARGS=(-l "$GAME_LANG")
+          fi
+
+          echo "=== Step 4A: Initial mac-app extract + automatic headless capture ==="
+          python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform mac-app -k "$KEYS_FILE" "${LANG_ARGS[@]}" || true
+
+          echo "=================================================================="
+          echo "READY FOR VNC CAPTURE!"
+          echo "Connect with VNC Viewer now. Visit Main Menu, Manager Career,"
+          echo "Player Career, and a full match until 609/609 shaders are captured."
+          echo "Close the game window when done to auto-zip & upload nvn_capture.zip!"
+          echo "=================================================================="
+          python3 scripts/nvn_capture_play.py "$GAME_DIR" "${LANG_ARGS[@]}" || true
+
+      - name: 5. Zip & Upload nvn_capture.zip to Gofile
+        script: |
+          set -euo pipefail
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+
+          CAP_DIR="$CM_BUILD_DIR/game_nsp/0100C49025D3E000_build/extract/v393216/nvn_capture"
+          ZIP_OUT="$CM_BUILD_DIR/nvn_capture.zip"
+
+          if [ ! -d "$CAP_DIR" ] || [ -z "$(ls -A "$CAP_DIR")" ]; then
+            echo "ERROR: No captured shaders found in $CAP_DIR!"
+            exit 1
+          fi
+
+          echo "Captured file count: $(ls -1 "$CAP_DIR" | wc -l)"
+          (cd "$(dirname "$CAP_DIR")" && zip -qry "$ZIP_OUT" "$(basename "$CAP_DIR")")
+          ls -lh "$ZIP_OUT"
+
+          python3 - "$ZIP_OUT" << 'EOF'
+          import os, sys, requests
+
+          zip_path = sys.argv[1]
+          srv = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
+          with open(zip_path, "rb") as f:
+              r = requests.post(f"https://{srv}.gofile.io/contents/uploadfile", files={"file": (os.path.basename(zip_path), f)}, timeout=600)
+          r.raise_for_status()
+          j = r.json()
+          if j.get("status") != "ok":
+              raise RuntimeError(f"Gofile upload failed: {j}")
+          link = j["data"]["downloadPage"]
+          print("\n==================================================")
+          print(f"CAPTURE GOFILE LINK (paste into CAPTURE_URL): {link}")
+          print("==================================================\n")
+          EOF
+
+  # =====================================================================
+  # WORKFLOW 2: Run this AFTER pasting nvn_capture.zip link into CAPTURE_URL!
+  # Builds EaSportsFc27.ipa (~1.6 GB) + romfs (~32 GB) and uploads all to Gofile.
+  # =====================================================================
+  build-fc27-ios:
+    name: 2. FC 27 Build iOS IPA + RomFS
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment: *common_env
+    scripts:
+      - *script_cleanup
+      - *script_tools
+      - *script_clone_and_download
+
+      - name: 4. Build FC 27 iOS IPA + RomFS
+        script: |
+          set -euo pipefail
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+          export DOTNET_ROOT="$HOME/.dotnet"
+          export DOTNET_ROOT_ARM64="$HOME/.dotnet"
+          export DOTNET_ROOT_X64="$HOME/.dotnet-x64"
+          export DOTNET_ROLL_FORWARD=Major
+          export PATH="$HOME/.dotnet:$PATH"
+
+          GAME_DIR="$CM_BUILD_DIR/game_nsp"
+          KEYS_FILE="$CM_BUILD_DIR/keys/prod.keys"
+          cd "$CM_BUILD_DIR/NX2Apple-FC27"
+
+          LANG_ARGS=()
+          if [ -n "${GAME_LANG:-}" ]; then
+            LANG_ARGS=(-l "$GAME_LANG")
+          fi
+
+          DM_ENTITLEMENTS=ios_entitlements.plist \
+            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform ios -k "$KEYS_FILE" "${LANG_ARGS[@]}"
+
+          IPA_PATH=$(find "$GAME_DIR" -maxdepth 2 -name "*.ipa" | head -n 1)
+          if [ -z "$IPA_PATH" ]; then
+            echo "ERROR: No .ipa generated!"
+            exit 1
+          fi
+
+          # Inject credit into Info.plist
+          WORK_IPA="$CM_BUILD_DIR/ipa_credit"
+          mkdir -p "$WORK_IPA"
+          unzip -qo "$IPA_PATH" -d "$WORK_IPA"
+          PLIST=$(find "$WORK_IPA/Payload" -maxdepth 2 -name "Info.plist" | head -n 1)
+          if [ -n "$PLIST" ]; then
+            /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright 'Port by Miaomiaocutene'" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string 'Port by Miaomiaocutene'" "$PLIST"
+          fi
+          rm -f "$IPA_PATH"
+          (cd "$WORK_IPA" && zip -qry "$IPA_PATH" Payload)
+          rm -rf "$WORK_IPA"
+
+          ls -lh "$IPA_PATH"
+          if [ -d "$GAME_DIR/romfs" ]; then
+            du -sh "$GAME_DIR/romfs"
+          fi
+
+      - name: 5. Upload IPA & RomFS Folder to Gofile
+        script: |
+          set -euo pipefail
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+
+          GAME_DIR="$CM_BUILD_DIR/game_nsp"
+          IPA_PATH=$(find "$GAME_DIR" -maxdepth 2 -name "*.ipa" | head -n 1)
+
+          python3 - "$IPA_PATH" "$GAME_DIR/romfs" << 'EOF'
+          import os, sys, glob, requests
+
+          ipa_path = sys.argv[1]
+          romfs_dir = sys.argv[2]
+
+          server = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
+          upload_url = f"https://{server}.gofile.io/contents/uploadfile"
+
+          def upload_file(path, folder_id=None, token=None):
+              size_mb = os.path.getsize(path) / (1024 * 1024)
+              print(f"Uploading {os.path.basename(path)} ({size_mb:.1f} MB)...")
+              data = {}
+              if folder_id:
+                  data["folderId"] = folder_id
+              if token:
+                  data["token"] = token
+              with open(path, "rb") as f:
+                  r = requests.post(upload_url, data=data, files={"file": (os.path.basename(path), f)}, timeout=1800)
+              r.raise_for_status()
+              j = r.json()
+              if j.get("status") != "ok":
+                  raise RuntimeError(f"Gofile upload failed: {j}")
+              return j["data"]
+
+          first = upload_file(ipa_path)
+          folder_id = first["parentFolder"]
+          token = first.get("guestToken")
+          download_page = first["downloadPage"]
+          print(f"\n==========================================")
+          print(f"GOFILE DOWNLOAD PAGE: {download_page}")
+          print(f"==========================================\n")
+
+          if os.path.isdir(romfs_dir):
+              for fp in sorted(glob.glob(os.path.join(romfs_dir, "*"))):
+                  if os.path.isfile(fp):
+                      upload_file(fp, folder_id=folder_id, token=token)
+
+          print(f"\nALL DONE! Download everything from: {download_page}")
+          EOF
