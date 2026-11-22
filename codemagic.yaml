@@ -3,8 +3,8 @@ definitions:
     groups:
       - fc27_secrets
     vars:
-      # Optional language code (leave empty for English, or e.g. "it", "fr", "es")
-      GAME_LANG: ""
+      # Language code: "en" for default English, or e.g. "it", "fr", "es"
+      GAME_LANG: "en"
     xcode: 27.0
 
   script_cleanup: &script_cleanup
@@ -170,7 +170,7 @@ workflows:
           cd "$CM_BUILD_DIR/NX2Apple-FC27"
 
           LANG_ARGS=()
-          if [ -n "${GAME_LANG:-}" ]; then
+          if [ "${GAME_LANG:-en}" != "en" ]; then
             LANG_ARGS=(-l "$GAME_LANG")
           fi
 
@@ -248,7 +248,7 @@ workflows:
           cd "$CM_BUILD_DIR/NX2Apple-FC27"
 
           LANG_ARGS=()
-          if [ -n "${GAME_LANG:-}" ]; then
+          if [ "${GAME_LANG:-en}" != "en" ]; then
             LANG_ARGS=(-l "$GAME_LANG")
           fi
 
