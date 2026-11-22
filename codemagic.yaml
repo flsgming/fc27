@@ -19,9 +19,16 @@ definitions:
       df -h /
 
   script_tools: &script_tools
-    name: 2. Install Build Tools & Python Environment
+    name: 2. Install Build Tools, Metal Toolchain & Python Environment
     script: |
       set -euo pipefail
+      # Download Metal Toolchain required by Xcode 27.x for compiling Metal shaders
+      if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+        echo "Downloading Xcode MetalToolchain..."
+        xcodebuild -downloadComponent MetalToolchain
+      fi
+      xcrun -sdk macosx metal --version
+
       brew install xcodegen zstd spirv-cross || true
 
       curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
@@ -156,7 +163,7 @@ workflows:
           fi
 
           echo "=== Step 4A: Initial mac-app extract + automatic headless capture ==="
-          python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform mac-app -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"} || true
+          python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform mac-app -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
 
           echo "=================================================================="
           echo "READY FOR VNC CAPTURE!"
