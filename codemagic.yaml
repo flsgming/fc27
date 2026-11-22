@@ -44,7 +44,7 @@ definitions:
 
       git clone --depth 1 https://github.com/sacoc96/NX2Apple-FC27.git "$CM_BUILD_DIR/NX2Apple-FC27"
       git clone --depth 1 https://github.com/ltsdw/gofile-downloader.git "$CM_BUILD_DIR/gf_dl"
-      find "$CM_BUILD_DIR/NX2Apple-FC27" -name "*.sh" -exec chmod +x {} + || true
+      find "$CM_BUILD_DIR/NX2Apple-FC27" \( -name "*.sh" -o -name "dmsh_xlate" -o -name "spirv-cross" -o -name "nx_extract" \) -exec chmod +x {} + || true
 
       GAME_DIR="$CM_BUILD_DIR/game_nsp"
       KEYS_DIR="$CM_BUILD_DIR/keys"
@@ -156,7 +156,7 @@ workflows:
           fi
 
           echo "=== Step 4A: Initial mac-app extract + automatic headless capture ==="
-          python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform mac-app -k "$KEYS_FILE" "${LANG_ARGS[@]}" || true
+          python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform mac-app -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"} || true
 
           echo "=================================================================="
           echo "READY FOR VNC CAPTURE!"
@@ -164,7 +164,7 @@ workflows:
           echo "Player Career, and a full match until 609/609 shaders are captured."
           echo "Close the game window when done to auto-zip & upload nvn_capture.zip!"
           echo "=================================================================="
-          python3 scripts/nvn_capture_play.py "$GAME_DIR" "${LANG_ARGS[@]}" || true
+          python3 scripts/nvn_capture_play.py "$GAME_DIR" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"} || true
 
       - name: 5. Zip & Upload nvn_capture.zip to Gofile
         script: |
@@ -234,7 +234,7 @@ workflows:
           fi
 
           DM_ENTITLEMENTS=ios_entitlements.plist \
-            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform ios -k "$KEYS_FILE" "${LANG_ARGS[@]}"
+            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform ios -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
 
           IPA_PATH=$(find "$GAME_DIR" -maxdepth 2 -name "*.ipa" | head -n 1)
           if [ -z "$IPA_PATH" ]; then
