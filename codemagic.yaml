@@ -9,7 +9,7 @@ workflows:
       vars:
         # Language code: "en" for default English, or e.g. "it", "fr", "es"
         GAME_LANG: "en"
-      xcode: 27.0
+      xcode: 27.2
     scripts:
       - name: 1. Free Disk Space (Target > 190 GB)
         script: |
@@ -254,7 +254,7 @@ workflows:
 
           # Hardware BC (no DM_PROF_TEX_BC_CPU), native 60 FPS + MetalFX from profile
           DM_ENTITLEMENTS="$CM_BUILD_DIR/ios_entitlements.plist" \
-            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform ios --romfs separate -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
+            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform ios --romfs separate --allow-other-metal -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
 
           IPA_PATH=$(find "$GAME_DIR" -maxdepth 2 -name "*.ipa" | head -n 1)
           if [ -z "$IPA_PATH" ]; then
