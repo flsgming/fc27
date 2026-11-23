@@ -8,19 +8,14 @@ definitions:
     xcode: 27.0
 
   script_cleanup: &script_cleanup
-    name: 1. Check Metal GPU & Free Disk Space (Target > 160 GB)
+    name: 1. Free Disk Space (Target > 190 GB)
     script: |
       set -euo pipefail
-      echo "=== Fail-fast Metal GPU check ==="
-      swift -e 'import Metal; if let d = MTLCreateSystemDefaultDevice() { print("Metal GPU OK:", d.name, "Apple7:", d.supportsFamily(.apple7), "Apple8:", d.supportsFamily(.apple8)) } else { print("WARNING: MTLCreateSystemDefaultDevice() returned nil (no Metal GPU in VM)") }' || true
-
-      echo "=== Disk before cleanup ==="
       df -h /
       rm -rf "${ANDROID_SDK_ROOT:-/usr/local/share/android-sdk}" "$HOME/Library/Android" || true
       xcrun simctl runtime delete all || true
       rm -rf "$HOME/Library/Caches/"* "$HOME/Library/Developer/Xcode/DerivedData/"* || true
       brew cleanup --prune=all || true
-      echo "=== Disk after cleanup ==="
       df -h /
 
   script_tools: &script_tools
@@ -97,7 +92,6 @@ definitions:
         download_url "$DLC_URL" "$GAME_DIR"
       fi
 
-      # Flatten subfolders created by Gofile downloader
       find "$GAME_DIR" -mindepth 2 -type f \( -iname "*.nsp" -o -iname "*.nsz" -o -iname "*.xci" \) -exec mv -f {} "$GAME_DIR/" \;
 
       KEY_FILE=$(find "$KEYS_DIR" -type f ! -name ".*" | head -n 1)
@@ -109,9 +103,8 @@ definitions:
         cp -f "$KEY_FILE" "$KEYS_DIR/prod.keys"
       fi
 
-      # Load existing nvn_capture.zip if provided
       if [ -n "${CAPTURE_URL:-}" ]; then
-        echo "Downloading existing nvn_capture.zip..."
+        echo "Downloading pre-captured nvn_capture.zip..."
         CAP_TMP="$CM_BUILD_DIR/cap_tmp"
         CAP_DEST="$GAME_DIR/0100C49025D3E000_build/extract/v393216/nvn_capture"
         mkdir -p "$CAP_TMP" "$CAP_DEST"
@@ -133,12 +126,12 @@ definitions:
 
 workflows:
   # =====================================================================
-  # Build FC 27 iOS IPA + RomFS (works both with CAPTURE_URL or without it)
-  # When CAPTURE_URL is empty, skips runtime NVN capture so Codemagic VM
-  # won't abort on missing Metal 4 GPU, and compiles all static .cas shaders.
+  # WORKFLOW 1: Build FC 27 iOS IPA + RomFS
+  # - Without CAPTURE_URL: skips Metal 4 VM capture, builds with static shaders.
+  # - With CAPTURE_URL (609 shaders from Mac): builds full 609/609 shader IPA.
   # =====================================================================
   build-fc27-ios:
-    name: FC 27 Build iOS IPA + RomFS
+    name: 1. FC 27 Build iOS IPA + RomFS
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment: *common_env
@@ -164,10 +157,8 @@ workflows:
 
           trap 'echo "=== ERROR LOGS ==="; for lf in "$LOG_DIR"/*.log; do [ -f "$lf" ] && echo "--- $lf ---" && tail -n 120 "$lf"; done' ERR
 
-          # If no pre-captured nvn_capture.zip is provided, disable nvn_capture.tsv
-          # so build_ipa_from_nsp.py skips the Metal 4 Mac-host capture step.
           if [ -z "${CAPTURE_URL:-}" ] && [ -f "dm/games/0100C49025D3E000/nvn_capture.tsv" ]; then
-            echo "CAPTURE_URL is empty -> skipping runtime NVN capture (disabling nvn_capture.tsv) to build with static shaders only."
+            echo "CAPTURE_URL is empty -> skipping runtime NVN capture to build with static shaders."
             mv -f "dm/games/0100C49025D3E000/nvn_capture.tsv" "dm/games/0100C49025D3E000/nvn_capture.tsv.disabled"
           fi
 
@@ -185,7 +176,6 @@ workflows:
             exit 1
           fi
 
-          # Inject credit into Info.plist
           WORK_IPA="$CM_BUILD_DIR/ipa_credit"
           mkdir -p "$WORK_IPA"
           unzip -qo "$IPA_PATH" -d "$WORK_IPA"
@@ -250,4 +240,164 @@ workflows:
                       upload_file(fp, folder_id=folder_id, token=token)
 
           print(f"\nALL DONE! Download everything from: {download_page}")
+          EOF
+
+  # =====================================================================
+  # WORKFLOW 2: Build Mac App + 1-Click Shader Capture Kit for a Mac Friend
+  # Produces EA SPORTS FC 27.app + Run_FC27_Capture.command split into 4 GB
+  # parts on Gofile so a friend on Apple Silicon Mac can capture all 609
+  # shaders without installing Xcode/Homebrew/Python/.NET.
+  # =====================================================================
+  build-fc27-mac-kit:
+    name: 2. FC 27 Build Mac App + Capture Kit (Gofile)
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment: *common_env
+    scripts:
+      - *script_cleanup
+      - *script_tools
+      - *script_clone_and_download
+
+      - name: 4. Build Mac App & Generate 1-Click Capture Kit
+        script: |
+          set -euo pipefail
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+          export DOTNET_ROOT="$HOME/.dotnet"
+          export DOTNET_ROOT_ARM64="$HOME/.dotnet"
+          export DOTNET_ROOT_X64="$HOME/.dotnet-x64"
+          export DOTNET_ROLL_FORWARD=Major
+          export PATH="$HOME/.dotnet:$PATH"
+
+          GAME_DIR="$CM_BUILD_DIR/game_nsp"
+          KEYS_FILE="$CM_BUILD_DIR/keys/prod.keys"
+          LOG_DIR="$GAME_DIR/0100C49025D3E000_build/logs"
+          cd "$CM_BUILD_DIR/NX2Apple-FC27"
+
+          trap 'echo "=== ERROR LOGS ==="; for lf in "$LOG_DIR"/*.log; do [ -f "$lf" ] && echo "--- $lf ---" && tail -n 120 "$lf"; done' ERR
+
+          # Disable VM capture during Codemagic build (keep copy for reference)
+          if [ -f "dm/games/0100C49025D3E000/nvn_capture.tsv" ]; then
+            cp -f "dm/games/0100C49025D3E000/nvn_capture.tsv" "$CM_BUILD_DIR/nvn_capture.tsv"
+            mv -f "dm/games/0100C49025D3E000/nvn_capture.tsv" "dm/games/0100C49025D3E000/nvn_capture.tsv.disabled"
+          fi
+
+          LANG_ARGS=()
+          if [ "${GAME_LANG:-en}" != "en" ]; then
+            LANG_ARGS=(-l "$GAME_LANG")
+          fi
+
+          python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform mac-app -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
+
+          APP_PATH=$(find "$GAME_DIR" -maxdepth 2 -name "*.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: No .app generated!"
+            exit 1
+          fi
+          APP_NAME=$(basename "$APP_PATH")
+
+          # Detect exact shader-capture env var used by NX2Apple-FC27/scripts/nvn_capture_play.py
+          CAP_ENV=$(python3 - << 'PYEOF'
+          import re
+          src = open("scripts/nvn_capture_play.py", "r", encoding="utf-8", errors="ignore").read()
+          m = re.findall(r'DM_[A-Z0-9_]*CAP[A-Z0-9_]*|DM_[A-Z0-9_]*SHADER[A-Z0-9_]*|DM_[A-Z0-9_]*DUMP[A-Z0-9_]*', src)
+          print(m[0] if m else "DM_NVN_SHADER_CAPTURE")
+          PYEOF
+          )
+          echo "Detected shader capture env var from nvn_capture_play.py: $CAP_ENV"
+
+          # Free NSPs and intermediate build folder before packaging to keep >150 GB free
+          KIT_DIR="$CM_BUILD_DIR/FC27_Mac_Kit"
+          mkdir -p "$KIT_DIR"
+          mv -f "$APP_PATH" "$KIT_DIR/$APP_NAME"
+          [ -f "$CM_BUILD_DIR/nvn_capture.tsv" ] && cp -f "$CM_BUILD_DIR/nvn_capture.tsv" "$KIT_DIR/nvn_capture.tsv"
+          rm -rf "$GAME_DIR"
+
+          cat << EOF > "$KIT_DIR/Run_FC27_Capture.command"
+          #!/bin/bash
+          set -e
+          DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+          APP="\$DIR/$APP_NAME"
+          OUT="\$HOME/Desktop/fc27_nvn_capture"
+          mkdir -p "\$OUT"
+
+          echo "Removing macOS quarantine..."
+          xattr -dr com.apple.quarantine "\$APP" 2>/dev/null || true
+
+          BIN=\$(find "\$APP/Contents/MacOS" -type f -perm +111 | head -n 1)
+          echo "Launching FC 27 with $CAP_ENV=\$OUT"
+          echo "Play through: Main Menu -> Manager Career (cutscenes, squad, contracts) -> Player Career -> 1 Full Match."
+          echo "Close the game window when finished to auto-create nvn_capture.zip on your Desktop!"
+          $CAP_ENV="\$OUT" "\$BIN" || true
+
+          echo ""
+          echo "Captured files: \$(ls -1 "\$OUT" | wc -l)"
+          (cd "\$HOME/Desktop" && zip -qry "\$HOME/Desktop/nvn_capture.zip" "fc27_nvn_capture")
+          echo "DONE! Please send \$HOME/Desktop/nvn_capture.zip back!"
+          read -p "Press Enter to close..."
+          EOF
+          chmod +x "$KIT_DIR/Run_FC27_Capture.command"
+
+          # Split into 4 GB uncompressed tar parts for reliable Gofile downloads
+          OUT_DIR="$CM_BUILD_DIR/mac_kit_upload"
+          mkdir -p "$OUT_DIR"
+          (cd "$CM_BUILD_DIR" && tar -cf - "FC27_Mac_Kit" | split -b 4000m - "$OUT_DIR/FC27_Mac_Kit.tar.part_")
+          rm -rf "$KIT_DIR"
+
+          cat << 'EOF' > "$OUT_DIR/1_Unpack_FC27_Mac.command"
+          #!/bin/bash
+          set -e
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          echo "Unpacking FC27_Mac_Kit from split parts..."
+          cat "$DIR"/FC27_Mac_Kit.tar.part_* | tar -xf - -C "$DIR"
+          echo "DONE! Open the FC27_Mac_Kit folder and double-click Run_FC27_Capture.command."
+          read -p "Press Enter to close..."
+          EOF
+          chmod +x "$OUT_DIR/1_Unpack_FC27_Mac.command"
+
+          ls -lh "$OUT_DIR"
+          df -h /
+
+      - name: 5. Upload Mac Capture Kit Parts to Gofile
+        script: |
+          set -euo pipefail
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+
+          python3 - "$CM_BUILD_DIR/mac_kit_upload" << 'EOF'
+          import os, sys, glob, requests
+
+          out_dir = sys.argv[1]
+          files = sorted(glob.glob(os.path.join(out_dir, "*")))
+          server = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
+          upload_url = f"https://{server}.gofile.io/contents/uploadfile"
+
+          folder_id = None
+          token = None
+          download_page = None
+
+          for fp in files:
+              if not os.path.isfile(fp):
+                  continue
+              size_mb = os.path.getsize(fp) / (1024 * 1024)
+              print(f"Uploading {os.path.basename(fp)} ({size_mb:.1f} MB)...")
+              data = {}
+              if folder_id:
+                  data["folderId"] = folder_id
+              if token:
+                  data["token"] = token
+              with open(fp, "rb") as f:
+                  r = requests.post(upload_url, data=data, files={"file": (os.path.basename(fp), f)}, timeout=1800)
+              r.raise_for_status()
+              j = r.json()
+              if j.get("status") != "ok":
+                  raise RuntimeError(f"Gofile upload failed: {j}")
+              res = j["data"]
+              if not folder_id:
+                  folder_id = res["parentFolder"]
+                  token = res.get("guestToken")
+                  download_page = res["downloadPage"]
+                  print(f"\n==========================================")
+                  print(f"MAC KIT GOFILE LINK: {download_page}")
+                  print(f"==========================================\n")
+
+          print(f"\nALL DONE! Share this Gofile link with your Mac friend: {download_page}")
           EOF
