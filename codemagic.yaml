@@ -1,6 +1,6 @@
 workflows:
   build-fc27-ios:
-    name: EA SPORTS FC 27 iOS (seedds/nxnative — A17 Pro+ Optimized)
+    name: EA SPORTS FC 27 iOS (IPA + romfs.img — A17 Pro+ & Miao Pink UI)
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment:
@@ -78,12 +78,11 @@ workflows:
           git clone --depth 1 https://github.com/ltsdw/gofile-downloader.git "$CM_BUILD_DIR/gf_dl"
           find "$CM_BUILD_DIR/nxnative" \( -name "*.sh" -o -name "dmsh_xlate" -o -name "spirv-cross" -o -name "nx_extract" \) -exec chmod +x {} + || true
 
-          # Fail-fast check before spending ~12 min downloading 36 GB
+          # Fail-fast check before downloading 36 GB
           if [ ! -f "$CM_BUILD_DIR/nxnative/dm/gfx/tools/frostbite.py" ] || [ ! -d "$CM_BUILD_DIR/nxnative/dm/games/0100C49025D3E000" ]; then
             echo "ERROR: seedds/nxnative missing frostbite.py or 0100C49025D3E000 profile!"
             exit 1
           fi
-          ls -la "$CM_BUILD_DIR/nxnative/dm/gfx/tools/frostbite.py" "$CM_BUILD_DIR/nxnative/dm/games/0100C49025D3E000/"
 
           GAME_DIR="$CM_BUILD_DIR/game_nsp"
           KEYS_DIR="$CM_BUILD_DIR/keys"
@@ -139,7 +138,7 @@ workflows:
           ls -lh "$GAME_DIR"
           df -h /
 
-      - name: 4. Inject Credit UI & Build FC 27 iOS IPA + Separate RomFS (A17 Pro+)
+      - name: 4. Apply Pink Miao UI Credit & Build FC 27 IPA + romfs.img (A17 Pro+)
         script: |
           set -euo pipefail
           source "$CM_BUILD_DIR/.venv/bin/activate"
@@ -151,12 +150,14 @@ workflows:
 
           GAME_DIR="$CM_BUILD_DIR/game_nsp"
           KEYS_FILE="$CM_BUILD_DIR/keys/prod.keys"
+          OUT_DIR="$CM_BUILD_DIR/final_out"
           LOG_DIR="$GAME_DIR/0100C49025D3E000_build/logs"
+          mkdir -p "$OUT_DIR"
           cd "$CM_BUILD_DIR/nxnative"
 
           trap 'echo "=== ERROR LOGS ==="; for lf in "$LOG_DIR"/*.log; do [ -f "$lf" ] && echo "--- $lf ---" && tail -n 120 "$lf"; done' ERR
 
-          # 4A. Inject "Port by Miaomiaocutene" + custom SwiftUI cat icon into Launcher.swift
+          # 4A. Patch Launcher.swift: pastel pink background + big centered clickable Discord credit card
           python3 - << 'PYEOF'
           import os, re, subprocess, shutil
 
@@ -166,13 +167,9 @@ workflows:
           ]
           target = next((p for p in candidates if os.path.isfile(p)), None)
           if not target:
-              print("WARNING: Launcher.swift not found, skipping Launcher UI credit patch.")
-              raise SystemExit(0)
+              raise RuntimeError("Launcher.swift not found — cannot inject credit UI!")
 
           orig = open(target, "r", encoding="utf-8").read()
-          if "Port by Miaomiaocutene" in orig:
-              print("Launcher.swift already contains credit.")
-              raise SystemExit(0)
 
           credit_defs = """
           private struct MiaoCatIcon: Shape {
@@ -192,33 +189,106 @@ workflows:
               }
           }
 
-          private struct MiaoCreditRow: View {
+          private struct MiaoCreditBanner: View {
+              private let discordURL = URL(string: "https://discord.com/users/893716299014873088")!
               var body: some View {
-                  HStack(spacing: 6) {
-                      MiaoCatIcon()
-                          .fill(Color(red: 1.0, green: 0.45, blue: 0.72))
-                          .frame(width: 16, height: 16)
-                      Text("Port by Miaomiaocutene")
-                          .font(.footnote.weight(.semibold))
-                          .foregroundStyle(.secondary)
+                  Link(destination: discordURL) {
+                      VStack(spacing: 6) {
+                          HStack(spacing: 8) {
+                              MiaoCatIcon()
+                                  .fill(Color(red: 0.93, green: 0.28, blue: 0.58))
+                                  .frame(width: 24, height: 24)
+                              Text("Port By Miaomiaocute nè")
+                                  .font(.title3.weight(.bold))
+                                  .foregroundColor(Color(red: 0.72, green: 0.12, blue: 0.42))
+                                  .multilineTextAlignment(.center)
+                          }
+                          Text("Nhấn để mở Discord")
+                              .font(.caption.weight(.semibold))
+                              .foregroundColor(Color(red: 0.85, green: 0.25, blue: 0.52))
+                      }
+                      .frame(maxWidth: .infinity, alignment: .center)
+                      .padding(.vertical, 14)
+                      .padding(.horizontal, 16)
+                      .background(
+                          RoundedRectangle(cornerRadius: 16, style: .continuous)
+                              .fill(Color(red: 1.0, green: 0.84, blue: 0.91))
+                      )
+                      .overlay(
+                          RoundedRectangle(cornerRadius: 16, style: .continuous)
+                              .stroke(Color(red: 0.96, green: 0.55, blue: 0.74), lineWidth: 1.5)
+                      )
                   }
+                  .buttonStyle(.plain)
                   .frame(maxWidth: .infinity, alignment: .center)
-                  .padding(.vertical, 4)
+              }
+          }
+
+          private struct MiaoPinkBackgroundModifier: ViewModifier {
+              func body(content: Content) -> some View {
+                  if #available(iOS 16.0, *) {
+                      content
+                          .scrollContentBackground(.hidden)
+                          .background(Color(red: 1.0, green: 0.93, blue: 0.96).ignoresSafeArea())
+                  } else {
+                      content
+                          .background(Color(red: 1.0, green: 0.93, blue: 0.96).ignoresSafeArea())
+                  }
               }
           }
           """
 
+          def find_matching_brace(text, open_brace_idx):
+              depth = 0
+              i = open_brace_idx
+              in_str = False
+              while i < len(text):
+                  ch = text[i]
+                  if ch == '"' and (i == 0 or text[i - 1] != '\\'):
+                      in_str = not in_str
+                  elif not in_str:
+                      if ch == '{':
+                          depth += 1
+                      elif ch == '}':
+                          depth -= 1
+                          if depth == 0:
+                              return i
+                  i += 1
+              return -1
+
           patched = None
-          for pat in [r'(Form\s*\{)', r'(List\s*\{)', r'(VStack(?:\([^)]*\))?\s*\{)']:
+          for kind, pat in [("form", r'Form\s*\{'), ("list", r'List\s*\{'), ("vstack", r'VStack(?:\([^)]*\))?\s*\{')]:
               m = re.search(pat, orig)
-              if m:
-                  idx = m.end()
-                  patched = orig[:idx] + "\n            MiaoCreditRow()\n" + orig[idx:] + "\n" + credit_defs
-                  break
+              if not m:
+                  continue
+              open_idx = m.end() - 1
+              close_idx = find_matching_brace(orig, open_idx)
+              if close_idx == -1:
+                  continue
+              if kind in ("form", "list"):
+                  banner_block = (
+                      "\n            Section {\n"
+                      "                MiaoCreditBanner()\n"
+                      "            }\n"
+                      "            .listRowBackground(Color.clear)\n"
+                      "            .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))\n"
+                  )
+              else:
+                  banner_block = "\n            MiaoCreditBanner()\n                .padding(.horizontal, 12)\n                .padding(.top, 8)\n"
+              patched = (
+                  orig[:m.end()]
+                  + banner_block
+                  + orig[m.end():close_idx + 1]
+                  + "\n        .modifier(MiaoPinkBackgroundModifier())"
+                  + orig[close_idx + 1:]
+                  + "\n"
+                  + credit_defs
+              )
+              print(f"Injected pastel pink background + centered Discord credit card into {kind} in {target}")
+              break
 
           if not patched:
-              print("WARNING: Could not find Form/List/VStack in Launcher.swift, skipping.")
-              raise SystemExit(0)
+              raise RuntimeError("Could not locate Form/List/VStack in Launcher.swift!")
 
           backup = target + ".bak"
           shutil.copy2(target, backup)
@@ -226,11 +296,11 @@ workflows:
 
           res = subprocess.run(["xcrun", "swiftc", "-parse", target], capture_output=True, text=True)
           if res.returncode != 0:
-              print("WARNING: swiftc -parse failed after credit patch, reverting Launcher.swift:", res.stderr)
+              print("ERROR: swiftc -parse failed on patched Launcher.swift:\n", res.stderr)
               shutil.move(backup, target)
-          else:
-              os.remove(backup)
-              print("Successfully patched Launcher.swift with MiaoCreditRow + MiaoCatIcon!")
+              raise SystemExit(1)
+          os.remove(backup)
+          print("Verified Launcher.swift syntax with swiftc -parse: OK!")
           PYEOF
 
           # 4B. Full RAM entitlements for iPhone 15 Pro+ (A17 Pro+, 8 GB+ RAM)
@@ -252,101 +322,101 @@ workflows:
             LANG_ARGS=(-l "$GAME_LANG")
           fi
 
-          # Hardware BC (no DM_PROF_TEX_BC_CPU), native 60 FPS + MetalFX from profile
+          # Hardware BC (A17 Pro+), native 60 FPS + MetalFX from profile
           DM_ENTITLEMENTS="$CM_BUILD_DIR/ios_entitlements.plist" \
             python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform ios --romfs separate --allow-other-metal -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
 
-          IPA_PATH=$(find "$GAME_DIR" -maxdepth 2 -name "*.ipa" | head -n 1)
-          if [ -z "$IPA_PATH" ]; then
-            echo "ERROR: No .ipa generated!"
+          # 4C. Move BOTH RomFS.img and EaSportsFc27.ipa out BEFORE cleaning build folder!
+          ROMFS_PATH=$(find "$GAME_DIR/0100C49025D3E000_build/extract" -maxdepth 2 -name "RomFS.img" ! -path "*.partial/*" | head -n 1 || true)
+          if [ -z "$ROMFS_PATH" ] || [ ! -f "$ROMFS_PATH" ]; then
+            echo "ERROR: RomFS.img not found after build!"
             exit 1
           fi
+          mv -f "$ROMFS_PATH" "$OUT_DIR/romfs.img"
 
-          # Free build intermediates before re-zipping IPA
-          rm -rf "$GAME_DIR/0100C49025D3E000_build"
+          IPA_PATH=$(find "$GAME_DIR" -maxdepth 2 -name "*.ipa" | head -n 1 || true)
+          if [ -z "$IPA_PATH" ] || [ ! -f "$IPA_PATH" ]; then
+            echo "ERROR: EaSportsFc27.ipa not found after build!"
+            exit 1
+          fi
+          mv -f "$IPA_PATH" "$OUT_DIR/EaSportsFc27.ipa"
 
-          # 4C. Inject credit into Info.plist
+          # Now safe to clean GAME_DIR (frees ~72 GB before re-zipping IPA)
+          rm -rf "$GAME_DIR"
+
+          # 4D. Inject credit into Info.plist inside EaSportsFc27.ipa
           WORK_IPA="$CM_BUILD_DIR/ipa_credit"
           mkdir -p "$WORK_IPA"
-          unzip -qo "$IPA_PATH" -d "$WORK_IPA"
+          unzip -qo "$OUT_DIR/EaSportsFc27.ipa" -d "$WORK_IPA"
           PLIST=$(find "$WORK_IPA/Payload" -maxdepth 2 -name "Info.plist" | head -n 1)
           if [ -n "$PLIST" ]; then
-            /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright 'Port by Miaomiaocutene'" "$PLIST" 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string 'Port by Miaomiaocutene'" "$PLIST"
+            /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright 'Port By Miaomiaocute nè'" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string 'Port By Miaomiaocute nè'" "$PLIST"
           fi
-          rm -f "$IPA_PATH"
-          (cd "$WORK_IPA" && zip -qry "$IPA_PATH" Payload)
+          rm -f "$OUT_DIR/EaSportsFc27.ipa"
+          (cd "$WORK_IPA" && zip -qry "$OUT_DIR/EaSportsFc27.ipa" Payload)
           rm -rf "$WORK_IPA"
 
-          echo "=== Build outputs ==="
-          ls -lh "$GAME_DIR"
+          # Final verification that BOTH files exist
+          ls -lh "$OUT_DIR/EaSportsFc27.ipa" "$OUT_DIR/romfs.img"
           df -h /
 
-      - name: 5. Upload IPA & RomFS Outputs to Gofile (4x Parallel + Auto-Retry)
+      - name: 5. Stream-Upload EaSportsFc27.ipa + romfs.img to Gofile (curl, 0 RAM Bloat)
         script: |
           set -euo pipefail
           source "$CM_BUILD_DIR/.venv/bin/activate"
 
-          GAME_DIR="$CM_BUILD_DIR/game_nsp"
+          OUT_DIR="$CM_BUILD_DIR/final_out"
+          [ -f "$OUT_DIR/EaSportsFc27.ipa" ] && [ -f "$OUT_DIR/romfs.img" ] || { echo "ERROR: Missing IPA or romfs.img in $OUT_DIR"; exit 1; }
 
-          python3 - "$GAME_DIR" << 'EOF'
-          import os, sys, glob, time, requests
-          from concurrent.futures import ThreadPoolExecutor, as_completed
+          SERVER=$(python3 -c 'import requests; print(requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"])')
+          UPLOAD_URL="https://${SERVER}.gofile.io/contents/uploadfile"
+          echo "Using Gofile server: $SERVER"
 
-          game_dir = sys.argv[1]
-          ipa_files = sorted(p for p in glob.glob(os.path.join(game_dir, "*.ipa")) if os.path.isfile(p))
-          romfs_files = sorted(p for p in glob.glob(os.path.join(game_dir, "*.img")) if os.path.isfile(p))
-          romfs_dir = os.path.join(game_dir, "romfs")
-          if os.path.isdir(romfs_dir):
-              romfs_files += sorted(p for p in glob.glob(os.path.join(romfs_dir, "*")) if os.path.isfile(p))
+          FOLDER_ID=""
+          GUEST_TOKEN=""
+          DOWNLOAD_PAGE=""
 
-          if not ipa_files:
-              raise RuntimeError(f"No .ipa found in {game_dir}")
+          upload_one() {
+            local fp="$1"
+            local name
+            name=$(basename "$fp")
+            local size_h
+            size_h=$(du -h "$fp" | cut -f1)
+            local attempt
+            for attempt in 1 2 3; do
+              echo "Uploading $name ($size_h) [try $attempt/3]..."
+              local CURL_ARGS=(-f -sS --max-time 5400 -F "file=@${fp}")
+              if [ -n "$FOLDER_ID" ]; then
+                CURL_ARGS+=(-F "folderId=${FOLDER_ID}" -F "token=${GUEST_TOKEN}")
+              fi
+              if RESP=$(curl "${CURL_ARGS[@]}" "$UPLOAD_URL"); then
+                STATUS=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status",""))' "$RESP")
+                if [ "$STATUS" = "ok" ]; then
+                  if [ -z "$FOLDER_ID" ]; then
+                    FOLDER_ID=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["data"]["parentFolder"])' "$RESP")
+                    GUEST_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["data"].get("guestToken",""))' "$RESP")
+                    DOWNLOAD_PAGE=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["data"]["downloadPage"])' "$RESP")
+                    echo ""
+                    echo "=========================================="
+                    echo "GOFILE DOWNLOAD PAGE: $DOWNLOAD_PAGE"
+                    echo "=========================================="
+                    echo ""
+                  fi
+                  echo "Done: $name"
+                  return 0
+                fi
+              fi
+              echo "WARN: Upload failed for $name (try $attempt), retrying in 10s..."
+              sleep 10
+            done
+            echo "ERROR: Upload failed after 3 tries for $name"
+            exit 1
+          }
 
-          server = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
-          upload_url = f"https://{server}.gofile.io/contents/uploadfile"
+          # Upload IPA first so the Gofile link appears immediately in the log
+          upload_one "$OUT_DIR/EaSportsFc27.ipa"
+          upload_one "$OUT_DIR/romfs.img"
 
-          def upload_with_retry(path, folder_id=None, token=None, retries=3):
-              size_mb = os.path.getsize(path) / (1024 * 1024)
-              name = os.path.basename(path)
-              for attempt in range(1, retries + 1):
-                  try:
-                      print(f"Uploading {name} ({size_mb:.1f} MB) [try {attempt}/{retries}]...", flush=True)
-                      data = {}
-                      if folder_id:
-                          data["folderId"] = folder_id
-                      if token:
-                          data["token"] = token
-                      with open(path, "rb") as f:
-                          r = requests.post(upload_url, data=data, files={"file": (name, f)}, timeout=1800)
-                      r.raise_for_status()
-                      j = r.json()
-                      if j.get("status") != "ok":
-                          raise RuntimeError(f"Gofile API error: {j}")
-                      print(f"Done: {name}", flush=True)
-                      return j["data"]
-                  except Exception as e:
-                      print(f"WARN: upload failed for {name} (try {attempt}): {e}", flush=True)
-                      if attempt == retries:
-                          raise
-                      time.sleep(5 * attempt)
-
-          # Upload IPA first to create folder and print download link immediately
-          first = upload_with_retry(ipa_files[0])
-          folder_id = first["parentFolder"]
-          token = first.get("guestToken")
-          download_page = first["downloadPage"]
-          print(f"\n==========================================", flush=True)
-          print(f"GOFILE DOWNLOAD PAGE: {download_page}", flush=True)
-          print(f"==========================================\n", flush=True)
-
-          # Upload remaining files in parallel (4 workers) to stay well within 120m limit
-          remaining = ipa_files[1:] + romfs_files
-          if remaining:
-              with ThreadPoolExecutor(max_workers=4) as pool:
-                  futs = {pool.submit(upload_with_retry, fp, folder_id, token): fp for fp in remaining}
-                  for fut in as_completed(futs):
-                      fut.result()
-
-          print(f"\nALL DONE! Download everything from: {download_page}", flush=True)
-          EOF
+          echo ""
+          echo "ALL DONE! Download BOTH EaSportsFc27.ipa & romfs.img from: $DOWNLOAD_PAGE"
