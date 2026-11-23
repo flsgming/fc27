@@ -9,7 +9,7 @@ workflows:
       vars:
         # Language code: "en" for default English, or e.g. "it", "fr", "es"
         GAME_LANG: "en"
-      xcode: 27.2
+      xcode: 27.0
     scripts:
       - name: 1. Free Disk Space (Target > 190 GB)
         script: |
