@@ -1,6 +1,6 @@
 workflows:
   build-fc27-ios:
-    name: EA SPORTS FC 27 iOS (mianmuhammadse/nxnative — Universal A16/A17+)
+    name: EA SPORTS FC 27 iOS (seedds/nxnative — A17 Pro+ Optimized)
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment:
@@ -21,18 +21,17 @@ workflows:
           brew cleanup --prune=all || true
           df -h /
 
-      - name: 2. Install Build Tools, Metal Toolchain & Python Environment
+      - name: 2. Install & Verify All Build Tools (Fail-Fast)
         script: |
           set -euo pipefail
+          # 2A. Metal Toolchain (with Xcode 26/27 DMG manual-mount fallback)
           if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
             echo "Downloading Xcode MetalToolchain..."
             xcodebuild -downloadComponent MetalToolchain || true
             sleep 3
           fi
-
-          # Fallback for Xcode 26/27 bug where MetalToolchain DMG downloads but fails to auto-mount
           if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
-            echo "MetalToolchain not auto-mounted; manually installing Metal.xctoolchain from downloaded DMG..."
+            echo "MetalToolchain not auto-mounted; manually installing Metal.xctoolchain from DMG..."
             DMG=$(find /System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain -name "*.dmg" 2>/dev/null | head -n 1 || true)
             if [ -n "$DMG" ]; then
               mkdir -p /tmp/metal_mnt
@@ -47,16 +46,22 @@ workflows:
             fi
             sudo xcodebuild -runFirstLaunch || true
           fi
-
           xcrun -sdk macosx metal --version
+          xcrun -sdk iphoneos metal --version
 
-          brew install xcodegen zstd spirv-cross || true
+          # 2B. CLI tools required by seedds/nxnative
+          brew install xcodegen zstd spirv-cross glslang || true
+          for tool in xcodegen zstd spirv-cross glslangValidator; do
+            command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: Missing required tool: $tool"; exit 1; }
+          done
 
+          # 2C. Dual-arch .NET 10 (arm64 + x64)
           curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
           chmod +x /tmp/dotnet-install.sh
           /tmp/dotnet-install.sh --channel 10.0 --architecture arm64 --install-dir "$HOME/.dotnet"
           /tmp/dotnet-install.sh --channel 10.0 --runtime dotnet --architecture x64 --install-dir "$HOME/.dotnet-x64"
 
+          # 2D. Python virtual environment
           python3 -m venv "$CM_BUILD_DIR/.venv"
           source "$CM_BUILD_DIR/.venv/bin/activate"
           pip install --no-cache-dir --upgrade pip
@@ -64,18 +69,18 @@ workflows:
             uv lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow \
             requests gdown "backports.zstd; python_version < '3.14'"
 
-      - name: 3. Clone mianmuhammadse/nxnative & Download Game Files
+      - name: 3. Clone Upstream seedds/nxnative & Download Game Files
         script: |
           set -euo pipefail
           source "$CM_BUILD_DIR/.venv/bin/activate"
 
-          git clone --depth 1 https://github.com/mianmuhammadse/nxnative.git "$CM_BUILD_DIR/nxnative"
+          git clone --depth 1 https://github.com/seedds/nxnative.git "$CM_BUILD_DIR/nxnative"
           git clone --depth 1 https://github.com/ltsdw/gofile-downloader.git "$CM_BUILD_DIR/gf_dl"
           find "$CM_BUILD_DIR/nxnative" \( -name "*.sh" -o -name "dmsh_xlate" -o -name "spirv-cross" -o -name "nx_extract" \) -exec chmod +x {} + || true
 
-          echo "=== Fail-fast check: Frostbite shader reader & FC 27 profile ==="
+          # Fail-fast check before spending ~12 min downloading 36 GB
           if [ ! -f "$CM_BUILD_DIR/nxnative/dm/gfx/tools/frostbite.py" ] || [ ! -d "$CM_BUILD_DIR/nxnative/dm/games/0100C49025D3E000" ]; then
-            echo "ERROR: mianmuhammadse/nxnative is missing dm/gfx/tools/frostbite.py or dm/games/0100C49025D3E000!"
+            echo "ERROR: seedds/nxnative missing frostbite.py or 0100C49025D3E000 profile!"
             exit 1
           fi
           ls -la "$CM_BUILD_DIR/nxnative/dm/gfx/tools/frostbite.py" "$CM_BUILD_DIR/nxnative/dm/games/0100C49025D3E000/"
@@ -134,7 +139,7 @@ workflows:
           ls -lh "$GAME_DIR"
           df -h /
 
-      - name: 4. Inject Credit UI & Build FC 27 iOS IPA + Separate RomFS
+      - name: 4. Inject Credit UI & Build FC 27 iOS IPA + Separate RomFS (A17 Pro+)
         script: |
           set -euo pipefail
           source "$CM_BUILD_DIR/.venv/bin/activate"
@@ -151,7 +156,7 @@ workflows:
 
           trap 'echo "=== ERROR LOGS ==="; for lf in "$LOG_DIR"/*.log; do [ -f "$lf" ] && echo "--- $lf ---" && tail -n 120 "$lf"; done' ERR
 
-          # Inject "Port by Miaomiaocutene" + custom SwiftUI cat icon into Launcher.swift
+          # 4A. Inject "Port by Miaomiaocutene" + custom SwiftUI cat icon into Launcher.swift
           python3 - << 'PYEOF'
           import os, re, subprocess, shutil
 
@@ -203,7 +208,6 @@ workflows:
           }
           """
 
-          # Insert MiaoCreditRow() inside the first Form/List/VStack body in Launcher.swift
           patched = None
           for pat in [r'(Form\s*\{)', r'(List\s*\{)', r'(VStack(?:\([^)]*\))?\s*\{)']:
               m = re.search(pat, orig)
@@ -220,7 +224,6 @@ workflows:
           shutil.copy2(target, backup)
           open(target, "w", encoding="utf-8").write(patched)
 
-          # Syntax-verify with swiftc -parse so we never break the build
           res = subprocess.run(["xcrun", "swiftc", "-parse", target], capture_output=True, text=True)
           if res.returncode != 0:
               print("WARNING: swiftc -parse failed after credit patch, reverting Launcher.swift:", res.stderr)
@@ -230,7 +233,7 @@ workflows:
               print("Successfully patched Launcher.swift with MiaoCreditRow + MiaoCatIcon!")
           PYEOF
 
-          # Create iOS entitlements with increased memory limit + extended virtual addressing
+          # 4B. Full RAM entitlements for iPhone 15 Pro+ (A17 Pro+, 8 GB+ RAM)
           cat << 'EOF' > "$CM_BUILD_DIR/ios_entitlements.plist"
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -249,6 +252,7 @@ workflows:
             LANG_ARGS=(-l "$GAME_LANG")
           fi
 
+          # Hardware BC (no DM_PROF_TEX_BC_CPU), native 60 FPS + MetalFX from profile
           DM_ENTITLEMENTS="$CM_BUILD_DIR/ios_entitlements.plist" \
             python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform ios --romfs separate -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
 
@@ -258,7 +262,10 @@ workflows:
             exit 1
           fi
 
-          # Also inject credit into Info.plist
+          # Free build intermediates before re-zipping IPA
+          rm -rf "$GAME_DIR/0100C49025D3E000_build"
+
+          # 4C. Inject credit into Info.plist
           WORK_IPA="$CM_BUILD_DIR/ipa_credit"
           mkdir -p "$WORK_IPA"
           unzip -qo "$IPA_PATH" -d "$WORK_IPA"
@@ -275,7 +282,7 @@ workflows:
           ls -lh "$GAME_DIR"
           df -h /
 
-      - name: 5. Upload IPA & RomFS Outputs to Gofile
+      - name: 5. Upload IPA & RomFS Outputs to Gofile (4x Parallel + Auto-Retry)
         script: |
           set -euo pipefail
           source "$CM_BUILD_DIR/.venv/bin/activate"
@@ -283,55 +290,63 @@ workflows:
           GAME_DIR="$CM_BUILD_DIR/game_nsp"
 
           python3 - "$GAME_DIR" << 'EOF'
-          import os, sys, glob, requests
+          import os, sys, glob, time, requests
+          from concurrent.futures import ThreadPoolExecutor, as_completed
 
           game_dir = sys.argv[1]
-          to_upload = []
-
-          for p in sorted(glob.glob(os.path.join(game_dir, "*.ipa"))):
-              if os.path.isfile(p):
-                  to_upload.append(p)
-          for p in sorted(glob.glob(os.path.join(game_dir, "*.img"))):
-              if os.path.isfile(p):
-                  to_upload.append(p)
+          ipa_files = sorted(p for p in glob.glob(os.path.join(game_dir, "*.ipa")) if os.path.isfile(p))
+          romfs_files = sorted(p for p in glob.glob(os.path.join(game_dir, "*.img")) if os.path.isfile(p))
           romfs_dir = os.path.join(game_dir, "romfs")
           if os.path.isdir(romfs_dir):
-              for p in sorted(glob.glob(os.path.join(romfs_dir, "*"))):
-                  if os.path.isfile(p):
-                      to_upload.append(p)
+              romfs_files += sorted(p for p in glob.glob(os.path.join(romfs_dir, "*")) if os.path.isfile(p))
 
-          if not to_upload:
-              raise RuntimeError(f"No IPA or RomFS files found in {game_dir}")
+          if not ipa_files:
+              raise RuntimeError(f"No .ipa found in {game_dir}")
 
           server = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
           upload_url = f"https://{server}.gofile.io/contents/uploadfile"
 
-          folder_id = None
-          token = None
-          download_page = None
+          def upload_with_retry(path, folder_id=None, token=None, retries=3):
+              size_mb = os.path.getsize(path) / (1024 * 1024)
+              name = os.path.basename(path)
+              for attempt in range(1, retries + 1):
+                  try:
+                      print(f"Uploading {name} ({size_mb:.1f} MB) [try {attempt}/{retries}]...", flush=True)
+                      data = {}
+                      if folder_id:
+                          data["folderId"] = folder_id
+                      if token:
+                          data["token"] = token
+                      with open(path, "rb") as f:
+                          r = requests.post(upload_url, data=data, files={"file": (name, f)}, timeout=1800)
+                      r.raise_for_status()
+                      j = r.json()
+                      if j.get("status") != "ok":
+                          raise RuntimeError(f"Gofile API error: {j}")
+                      print(f"Done: {name}", flush=True)
+                      return j["data"]
+                  except Exception as e:
+                      print(f"WARN: upload failed for {name} (try {attempt}): {e}", flush=True)
+                      if attempt == retries:
+                          raise
+                      time.sleep(5 * attempt)
 
-          for fp in to_upload:
-              size_mb = os.path.getsize(fp) / (1024 * 1024)
-              print(f"Uploading {os.path.basename(fp)} ({size_mb:.1f} MB)...")
-              data = {}
-              if folder_id:
-                  data["folderId"] = folder_id
-              if token:
-                  data["token"] = token
-              with open(fp, "rb") as f:
-                  r = requests.post(upload_url, data=data, files={"file": (os.path.basename(fp), f)}, timeout=1800)
-              r.raise_for_status()
-              j = r.json()
-              if j.get("status") != "ok":
-                  raise RuntimeError(f"Gofile upload failed: {j}")
-              res = j["data"]
-              if not folder_id:
-                  folder_id = res["parentFolder"]
-                  token = res.get("guestToken")
-                  download_page = res["downloadPage"]
-                  print(f"\n==========================================")
-                  print(f"GOFILE DOWNLOAD PAGE: {download_page}")
-                  print(f"==========================================\n")
+          # Upload IPA first to create folder and print download link immediately
+          first = upload_with_retry(ipa_files[0])
+          folder_id = first["parentFolder"]
+          token = first.get("guestToken")
+          download_page = first["downloadPage"]
+          print(f"\n==========================================", flush=True)
+          print(f"GOFILE DOWNLOAD PAGE: {download_page}", flush=True)
+          print(f"==========================================\n", flush=True)
 
-          print(f"\nALL DONE! Download everything from: {download_page}")
+          # Upload remaining files in parallel (4 workers) to stay well within 120m limit
+          remaining = ipa_files[1:] + romfs_files
+          if remaining:
+              with ThreadPoolExecutor(max_workers=4) as pool:
+                  futs = {pool.submit(upload_with_retry, fp, folder_id, token): fp for fp in remaining}
+                  for fut in as_completed(futs):
+                      fut.result()
+
+          print(f"\nALL DONE! Download everything from: {download_page}", flush=True)
           EOF
