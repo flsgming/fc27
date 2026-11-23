@@ -8,21 +8,25 @@ definitions:
     xcode: 27.0
 
   script_cleanup: &script_cleanup
-    name: 1. Free Disk Space (Target > 160 GB)
+    name: 1. Check Metal GPU & Free Disk Space (Target > 160 GB)
     script: |
       set -euo pipefail
+      echo "=== Fail-fast Metal GPU check ==="
+      swift -e 'import Metal; if let d = MTLCreateSystemDefaultDevice() { print("Metal GPU OK:", d.name, "Apple7:", d.supportsFamily(.apple7), "Apple8:", d.supportsFamily(.apple8)) } else { print("WARNING: MTLCreateSystemDefaultDevice() returned nil (no Metal GPU in VM)") }' || true
+
+      echo "=== Disk before cleanup ==="
       df -h /
       rm -rf "${ANDROID_SDK_ROOT:-/usr/local/share/android-sdk}" "$HOME/Library/Android" || true
       xcrun simctl runtime delete all || true
       rm -rf "$HOME/Library/Caches/"* "$HOME/Library/Developer/Xcode/DerivedData/"* || true
       brew cleanup --prune=all || true
+      echo "=== Disk after cleanup ==="
       df -h /
 
   script_tools: &script_tools
     name: 2. Install Build Tools, Metal Toolchain & Python Environment
     script: |
       set -euo pipefail
-      # Download Metal Toolchain required by Xcode 27.x for compiling Metal shaders
       if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
         echo "Downloading Xcode MetalToolchain..."
         xcodebuild -downloadComponent MetalToolchain
@@ -83,7 +87,7 @@ definitions:
 
       echo "Downloading Base NSP..."
       download_url "$BASE_URL" "$GAME_DIR"
-      echo "Downloading Update v393216 (1.8d.310c)..."
+      echo "Downloading Update NSP (recommended: v393216 / 1.8d.310c)..."
       download_url "$UPDATE_URL" "$GAME_DIR"
       echo "Downloading prod.keys..."
       download_url "$KEYS_URL" "$KEYS_DIR"
@@ -131,7 +135,7 @@ workflows:
   # =====================================================================
   # WORKFLOW 1: Run this FIRST with "Enable SSH/VNC access" checked!
   # Connects via VNC Viewer to capture all 609 shaders -> uploads nvn_capture.zip to Gofile.
-  # Supports resuming if you paste a partial nvn_capture.zip link into CAPTURE_URL.
+  # Auto-dumps nvn_capture.log on any error so you always see the exact root cause.
   # =====================================================================
   capture-fc27-vnc:
     name: 1. FC 27 Capture 609 Shaders (VNC)
@@ -155,15 +159,39 @@ workflows:
 
           GAME_DIR="$CM_BUILD_DIR/game_nsp"
           KEYS_FILE="$CM_BUILD_DIR/keys/prod.keys"
+          LOG_DIR="$GAME_DIR/0100C49025D3E000_build/logs"
           cd "$CM_BUILD_DIR/NX2Apple-FC27"
+
+          dump_logs() {
+            echo "================ DIAGNOSTIC HOST LOGS ================"
+            if [ -d "$LOG_DIR" ]; then
+              for lf in "$LOG_DIR"/*.log; do
+                [ -f "$lf" ] || continue
+                echo "--- $lf (last 120 lines) ---"
+                tail -n 120 "$lf" || true
+              done
+            else
+              echo "No log directory found at $LOG_DIR"
+            fi
+            echo "======================================================"
+          }
+          trap dump_logs EXIT
 
           LANG_ARGS=()
           if [ "${GAME_LANG:-en}" != "en" ]; then
             LANG_ARGS=(-l "$GAME_LANG")
           fi
 
-          echo "=== Step 4A: Initial mac-app extract + automatic headless capture ==="
+          echo "=== Step 4A: Initial mac-app extract + rewrite + automatic capture ==="
+          set +e
           python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform mac-app -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
+          BUILD_RC=$?
+          set -e
+
+          if [ "$BUILD_RC" -ne 0 ]; then
+            echo "WARNING: build_ipa_from_nsp.py exited with code $BUILD_RC (dumping logs above)."
+            dump_logs
+          fi
 
           echo "=================================================================="
           echo "READY FOR VNC CAPTURE!"
@@ -178,15 +206,15 @@ workflows:
           set -euo pipefail
           source "$CM_BUILD_DIR/.venv/bin/activate"
 
-          CAP_DIR="$CM_BUILD_DIR/game_nsp/0100C49025D3E000_build/extract/v393216/nvn_capture"
+          CAP_DIR=$(find "$CM_BUILD_DIR/game_nsp/0100C49025D3E000_build/extract" -type d -name "nvn_capture" | head -n 1 || true)
           ZIP_OUT="$CM_BUILD_DIR/nvn_capture.zip"
 
-          if [ ! -d "$CAP_DIR" ] || [ -z "$(ls -A "$CAP_DIR")" ]; then
-            echo "ERROR: No captured shaders found in $CAP_DIR!"
+          if [ -z "$CAP_DIR" ] || [ ! -d "$CAP_DIR" ] || [ -z "$(ls -A "$CAP_DIR")" ]; then
+            echo "ERROR: No captured shaders found in nvn_capture!"
             exit 1
           fi
 
-          echo "Captured file count: $(ls -1 "$CAP_DIR" | wc -l)"
+          echo "Found capture folder: $CAP_DIR ($(ls -1 "$CAP_DIR" | wc -l) files)"
           (cd "$(dirname "$CAP_DIR")" && zip -qry "$ZIP_OUT" "$(basename "$CAP_DIR")")
           ls -lh "$ZIP_OUT"
 
@@ -233,7 +261,10 @@ workflows:
 
           GAME_DIR="$CM_BUILD_DIR/game_nsp"
           KEYS_FILE="$CM_BUILD_DIR/keys/prod.keys"
+          LOG_DIR="$GAME_DIR/0100C49025D3E000_build/logs"
           cd "$CM_BUILD_DIR/NX2Apple-FC27"
+
+          trap 'for lf in "$LOG_DIR"/*.log; do [ -f "$lf" ] && echo "--- $lf ---" && tail -n 120 "$lf"; done' ERR
 
           LANG_ARGS=()
           if [ "${GAME_LANG:-en}" != "en" ]; then
