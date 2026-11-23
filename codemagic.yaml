@@ -87,7 +87,7 @@ definitions:
 
       echo "Downloading Base NSP..."
       download_url "$BASE_URL" "$GAME_DIR"
-      echo "Downloading Update NSP (recommended: v393216 / 1.8d.310c)..."
+      echo "Downloading Update NSP..."
       download_url "$UPDATE_URL" "$GAME_DIR"
       echo "Downloading prod.keys..."
       download_url "$KEYS_URL" "$KEYS_DIR"
@@ -109,7 +109,7 @@ definitions:
         cp -f "$KEY_FILE" "$KEYS_DIR/prod.keys"
       fi
 
-      # Load existing nvn_capture.zip if provided (supports resuming capture or full iOS build)
+      # Load existing nvn_capture.zip if provided
       if [ -n "${CAPTURE_URL:-}" ]; then
         echo "Downloading existing nvn_capture.zip..."
         CAP_TMP="$CM_BUILD_DIR/cap_tmp"
@@ -133,114 +133,12 @@ definitions:
 
 workflows:
   # =====================================================================
-  # WORKFLOW 1: Run this FIRST with "Enable SSH/VNC access" checked!
-  # Connects via VNC Viewer to capture all 609 shaders -> uploads nvn_capture.zip to Gofile.
-  # Auto-dumps nvn_capture.log on any error so you always see the exact root cause.
-  # =====================================================================
-  capture-fc27-vnc:
-    name: 1. FC 27 Capture 609 Shaders (VNC)
-    instance_type: mac_mini_m2
-    max_build_duration: 120
-    environment: *common_env
-    scripts:
-      - *script_cleanup
-      - *script_tools
-      - *script_clone_and_download
-
-      - name: 4. Prepare Mac Build & Launch Interactive Capture (Connect VNC Now!)
-        script: |
-          set -euo pipefail
-          source "$CM_BUILD_DIR/.venv/bin/activate"
-          export DOTNET_ROOT="$HOME/.dotnet"
-          export DOTNET_ROOT_ARM64="$HOME/.dotnet"
-          export DOTNET_ROOT_X64="$HOME/.dotnet-x64"
-          export DOTNET_ROLL_FORWARD=Major
-          export PATH="$HOME/.dotnet:$PATH"
-
-          GAME_DIR="$CM_BUILD_DIR/game_nsp"
-          KEYS_FILE="$CM_BUILD_DIR/keys/prod.keys"
-          LOG_DIR="$GAME_DIR/0100C49025D3E000_build/logs"
-          cd "$CM_BUILD_DIR/NX2Apple-FC27"
-
-          dump_logs() {
-            echo "================ DIAGNOSTIC HOST LOGS ================"
-            if [ -d "$LOG_DIR" ]; then
-              for lf in "$LOG_DIR"/*.log; do
-                [ -f "$lf" ] || continue
-                echo "--- $lf (last 120 lines) ---"
-                tail -n 120 "$lf" || true
-              done
-            else
-              echo "No log directory found at $LOG_DIR"
-            fi
-            echo "======================================================"
-          }
-          trap dump_logs EXIT
-
-          LANG_ARGS=()
-          if [ "${GAME_LANG:-en}" != "en" ]; then
-            LANG_ARGS=(-l "$GAME_LANG")
-          fi
-
-          echo "=== Step 4A: Initial mac-app extract + rewrite + automatic capture ==="
-          set +e
-          python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform mac-app -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
-          BUILD_RC=$?
-          set -e
-
-          if [ "$BUILD_RC" -ne 0 ]; then
-            echo "WARNING: build_ipa_from_nsp.py exited with code $BUILD_RC (dumping logs above)."
-            dump_logs
-          fi
-
-          echo "=================================================================="
-          echo "READY FOR VNC CAPTURE!"
-          echo "Connect with VNC Viewer now. Visit Main Menu, Manager Career,"
-          echo "Player Career, and a full match until 609/609 shaders are captured."
-          echo "Close the game window when done to auto-zip & upload nvn_capture.zip!"
-          echo "=================================================================="
-          python3 scripts/nvn_capture_play.py "$GAME_DIR" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"} || true
-
-      - name: 5. Zip & Upload nvn_capture.zip to Gofile
-        script: |
-          set -euo pipefail
-          source "$CM_BUILD_DIR/.venv/bin/activate"
-
-          CAP_DIR=$(find "$CM_BUILD_DIR/game_nsp/0100C49025D3E000_build/extract" -type d -name "nvn_capture" | head -n 1 || true)
-          ZIP_OUT="$CM_BUILD_DIR/nvn_capture.zip"
-
-          if [ -z "$CAP_DIR" ] || [ ! -d "$CAP_DIR" ] || [ -z "$(ls -A "$CAP_DIR")" ]; then
-            echo "ERROR: No captured shaders found in nvn_capture!"
-            exit 1
-          fi
-
-          echo "Found capture folder: $CAP_DIR ($(ls -1 "$CAP_DIR" | wc -l) files)"
-          (cd "$(dirname "$CAP_DIR")" && zip -qry "$ZIP_OUT" "$(basename "$CAP_DIR")")
-          ls -lh "$ZIP_OUT"
-
-          python3 - "$ZIP_OUT" << 'EOF'
-          import os, sys, requests
-
-          zip_path = sys.argv[1]
-          srv = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
-          with open(zip_path, "rb") as f:
-              r = requests.post(f"https://{srv}.gofile.io/contents/uploadfile", files={"file": (os.path.basename(zip_path), f)}, timeout=600)
-          r.raise_for_status()
-          j = r.json()
-          if j.get("status") != "ok":
-              raise RuntimeError(f"Gofile upload failed: {j}")
-          link = j["data"]["downloadPage"]
-          print("\n==================================================")
-          print(f"CAPTURE GOFILE LINK (paste into CAPTURE_URL): {link}")
-          print("==================================================\n")
-          EOF
-
-  # =====================================================================
-  # WORKFLOW 2: Run this AFTER pasting nvn_capture.zip link into CAPTURE_URL!
-  # Builds EaSportsFc27.ipa (~1.6 GB) + romfs (~32 GB) and uploads all to Gofile.
+  # Build FC 27 iOS IPA + RomFS (works both with CAPTURE_URL or without it)
+  # When CAPTURE_URL is empty, skips runtime NVN capture so Codemagic VM
+  # won't abort on missing Metal 4 GPU, and compiles all static .cas shaders.
   # =====================================================================
   build-fc27-ios:
-    name: 2. FC 27 Build iOS IPA + RomFS
+    name: FC 27 Build iOS IPA + RomFS
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment: *common_env
@@ -264,7 +162,14 @@ workflows:
           LOG_DIR="$GAME_DIR/0100C49025D3E000_build/logs"
           cd "$CM_BUILD_DIR/NX2Apple-FC27"
 
-          trap 'for lf in "$LOG_DIR"/*.log; do [ -f "$lf" ] && echo "--- $lf ---" && tail -n 120 "$lf"; done' ERR
+          trap 'echo "=== ERROR LOGS ==="; for lf in "$LOG_DIR"/*.log; do [ -f "$lf" ] && echo "--- $lf ---" && tail -n 120 "$lf"; done' ERR
+
+          # If no pre-captured nvn_capture.zip is provided, disable nvn_capture.tsv
+          # so build_ipa_from_nsp.py skips the Metal 4 Mac-host capture step.
+          if [ -z "${CAPTURE_URL:-}" ] && [ -f "dm/games/0100C49025D3E000/nvn_capture.tsv" ]; then
+            echo "CAPTURE_URL is empty -> skipping runtime NVN capture (disabling nvn_capture.tsv) to build with static shaders only."
+            mv -f "dm/games/0100C49025D3E000/nvn_capture.tsv" "dm/games/0100C49025D3E000/nvn_capture.tsv.disabled"
+          fi
 
           LANG_ARGS=()
           if [ "${GAME_LANG:-en}" != "en" ]; then
