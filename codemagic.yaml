@@ -1,166 +1,140 @@
-definitions:
-  common_env: &common_env
-    groups:
-      - fc27_secrets
-    vars:
-      # Language code: "en" for default English, or e.g. "it", "fr", "es"
-      GAME_LANG: "en"
-    xcode: 27.0
-
-  script_cleanup: &script_cleanup
-    name: 1. Free Disk Space (Target > 190 GB)
-    script: |
-      set -euo pipefail
-      df -h /
-      rm -rf "${ANDROID_SDK_ROOT:-/usr/local/share/android-sdk}" "$HOME/Library/Android" || true
-      xcrun simctl runtime delete all || true
-      rm -rf "$HOME/Library/Caches/"* "$HOME/Library/Developer/Xcode/DerivedData/"* || true
-      brew cleanup --prune=all || true
-      df -h /
-
-  script_tools: &script_tools
-    name: 2. Install Build Tools, Metal Toolchain & Python Environment
-    script: |
-      set -euo pipefail
-      if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
-        echo "Downloading Xcode MetalToolchain..."
-        xcodebuild -downloadComponent MetalToolchain || true
-        sleep 3
-      fi
-
-      # Fallback for Xcode 26/27 bug where MetalToolchain DMG downloads but fails to auto-mount
-      if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
-        echo "MetalToolchain not auto-mounted; manually installing Metal.xctoolchain from downloaded DMG..."
-        DMG=$(find /System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain -name "*.dmg" 2>/dev/null | head -n 1 || true)
-        if [ -n "$DMG" ]; then
-          mkdir -p /tmp/metal_mnt
-          hdiutil attach -nobrowse -readonly "$DMG" -mountpoint /tmp/metal_mnt
-          TC=$(find /tmp/metal_mnt -maxdepth 3 -name "Metal.xctoolchain" -type d | head -n 1 || true)
-          if [ -n "$TC" ]; then
-            sudo mkdir -p /Library/Developer/Toolchains
-            sudo rm -rf /Library/Developer/Toolchains/Metal.xctoolchain
-            sudo cp -R "$TC" /Library/Developer/Toolchains/Metal.xctoolchain
-          fi
-          hdiutil detach /tmp/metal_mnt || true
-        fi
-        sudo xcodebuild -runFirstLaunch || true
-      fi
-
-      xcrun -sdk macosx metal --version
-
-      brew install xcodegen zstd spirv-cross || true
-
-      curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-      chmod +x /tmp/dotnet-install.sh
-      /tmp/dotnet-install.sh --channel 10.0 --architecture arm64 --install-dir "$HOME/.dotnet"
-      /tmp/dotnet-install.sh --channel 10.0 --runtime dotnet --architecture x64 --install-dir "$HOME/.dotnet-x64"
-
-      python3 -m venv "$CM_BUILD_DIR/.venv"
-      source "$CM_BUILD_DIR/.venv/bin/activate"
-      pip install --no-cache-dir --upgrade pip
-      pip install --no-cache-dir \
-        uv lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow \
-        requests gdown "backports.zstd; python_version < '3.14'"
-
-  script_clone_and_download: &script_clone_and_download
-    name: 3. Clone NX2Apple-FC27 & Download Game Files
-    script: |
-      set -euo pipefail
-      source "$CM_BUILD_DIR/.venv/bin/activate"
-
-      git clone --depth 1 https://github.com/sacoc96/NX2Apple-FC27.git "$CM_BUILD_DIR/NX2Apple-FC27"
-      git clone --depth 1 https://github.com/ltsdw/gofile-downloader.git "$CM_BUILD_DIR/gf_dl"
-      find "$CM_BUILD_DIR/NX2Apple-FC27" \( -name "*.sh" -o -name "dmsh_xlate" -o -name "spirv-cross" -o -name "nx_extract" \) -exec chmod +x {} + || true
-
-      GAME_DIR="$CM_BUILD_DIR/game_nsp"
-      KEYS_DIR="$CM_BUILD_DIR/keys"
-      mkdir -p "$GAME_DIR" "$KEYS_DIR"
-
-      download_url() {
-        local url="$1"
-        local out_dir="$2"
-        mkdir -p "$out_dir"
-        if [[ "$url" == *"gofile.io/d/"* ]]; then
-          echo "Downloading from Gofile via gofile-downloader.py..."
-          (cd "$CM_BUILD_DIR/gf_dl" && GF_DOWNLOAD_DIR="$out_dir" uv run gofile-downloader.py "$url")
-        elif [[ "$url" == *"drive.google.com"* ]]; then
-          echo "Downloading from Google Drive via gdown..."
-          gdown "$url" -O "$out_dir/"
-        else
-          echo "Downloading direct URL..."
-          local fname
-          fname=$(basename "${url%%\?*}")
-          [ -n "$fname" ] || fname="downloaded_file"
-          curl -fL --retry 3 "$url" -o "$out_dir/$fname"
-        fi
-      }
-
-      if [ -z "${BASE_URL:-}" ] || [ -z "${UPDATE_URL:-}" ] || [ -z "${KEYS_URL:-}" ]; then
-        echo "ERROR: BASE_URL, UPDATE_URL, and KEYS_URL must be set in group fc27_secrets."
-        exit 1
-      fi
-
-      echo "Downloading Base NSP..."
-      download_url "$BASE_URL" "$GAME_DIR"
-      echo "Downloading Update NSP..."
-      download_url "$UPDATE_URL" "$GAME_DIR"
-      echo "Downloading prod.keys..."
-      download_url "$KEYS_URL" "$KEYS_DIR"
-
-      if [ -n "${DLC_URL:-}" ]; then
-        echo "Downloading optional DLC..."
-        download_url "$DLC_URL" "$GAME_DIR"
-      fi
-
-      find "$GAME_DIR" -mindepth 2 -type f \( -iname "*.nsp" -o -iname "*.nsz" -o -iname "*.xci" \) -exec mv -f {} "$GAME_DIR/" \;
-
-      KEY_FILE=$(find "$KEYS_DIR" -type f ! -name ".*" | head -n 1)
-      if [ -z "$KEY_FILE" ]; then
-        echo "ERROR: prod.keys not found after download!"
-        exit 1
-      fi
-      if [ "$KEY_FILE" != "$KEYS_DIR/prod.keys" ]; then
-        cp -f "$KEY_FILE" "$KEYS_DIR/prod.keys"
-      fi
-
-      if [ -n "${CAPTURE_URL:-}" ]; then
-        echo "Downloading pre-captured nvn_capture.zip..."
-        CAP_TMP="$CM_BUILD_DIR/cap_tmp"
-        CAP_DEST="$GAME_DIR/0100C49025D3E000_build/extract/v393216/nvn_capture"
-        mkdir -p "$CAP_TMP" "$CAP_DEST"
-        download_url "$CAPTURE_URL" "$CAP_TMP"
-        CAP_ARCH=$(find "$CAP_TMP" -type f -iname "*.zip" | head -n 1 || true)
-        if [ -n "$CAP_ARCH" ]; then
-          unzip -qo "$CAP_ARCH" -d "$CAP_DEST"
-          if [ -d "$CAP_DEST/nvn_capture" ]; then
-            mv -f "$CAP_DEST/nvn_capture/"* "$CAP_DEST/"
-            rmdir "$CAP_DEST/nvn_capture" || true
-          fi
-        fi
-        rm -rf "$CAP_TMP"
-        echo "Loaded pre-captured files: $(ls -1 "$CAP_DEST" | wc -l)"
-      fi
-
-      ls -lh "$GAME_DIR"
-      df -h /
-
 workflows:
-  # =====================================================================
-  # WORKFLOW 1: Build FC 27 iOS IPA + RomFS
-  # - Without CAPTURE_URL: skips Metal 4 VM capture, builds with static shaders.
-  # - With CAPTURE_URL (609 shaders from Mac): builds full 609/609 shader IPA.
-  # =====================================================================
   build-fc27-ios:
-    name: 1. FC 27 Build iOS IPA + RomFS
+    name: EA SPORTS FC 27 iOS (mianmuhammadse/nxnative — Universal A16/A17+)
     instance_type: mac_mini_m2
     max_build_duration: 120
-    environment: *common_env
+    environment:
+      groups:
+        - fc27_secrets
+      vars:
+        # Language code: "en" for default English, or e.g. "it", "fr", "es"
+        GAME_LANG: "en"
+      xcode: 27.0
     scripts:
-      - *script_cleanup
-      - *script_tools
-      - *script_clone_and_download
+      - name: 1. Free Disk Space (Target > 190 GB)
+        script: |
+          set -euo pipefail
+          df -h /
+          rm -rf "${ANDROID_SDK_ROOT:-/usr/local/share/android-sdk}" "$HOME/Library/Android" || true
+          xcrun simctl runtime delete all || true
+          rm -rf "$HOME/Library/Caches/"* "$HOME/Library/Developer/Xcode/DerivedData/"* || true
+          brew cleanup --prune=all || true
+          df -h /
 
-      - name: 4. Build FC 27 iOS IPA + RomFS
+      - name: 2. Install Build Tools, Metal Toolchain & Python Environment
+        script: |
+          set -euo pipefail
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            echo "Downloading Xcode MetalToolchain..."
+            xcodebuild -downloadComponent MetalToolchain || true
+            sleep 3
+          fi
+
+          # Fallback for Xcode 26/27 bug where MetalToolchain DMG downloads but fails to auto-mount
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            echo "MetalToolchain not auto-mounted; manually installing Metal.xctoolchain from downloaded DMG..."
+            DMG=$(find /System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain -name "*.dmg" 2>/dev/null | head -n 1 || true)
+            if [ -n "$DMG" ]; then
+              mkdir -p /tmp/metal_mnt
+              hdiutil attach -nobrowse -readonly "$DMG" -mountpoint /tmp/metal_mnt
+              TC=$(find /tmp/metal_mnt -maxdepth 3 -name "Metal.xctoolchain" -type d | head -n 1 || true)
+              if [ -n "$TC" ]; then
+                sudo mkdir -p /Library/Developer/Toolchains
+                sudo rm -rf /Library/Developer/Toolchains/Metal.xctoolchain
+                sudo cp -R "$TC" /Library/Developer/Toolchains/Metal.xctoolchain
+              fi
+              hdiutil detach /tmp/metal_mnt || true
+            fi
+            sudo xcodebuild -runFirstLaunch || true
+          fi
+
+          xcrun -sdk macosx metal --version
+
+          brew install xcodegen zstd spirv-cross || true
+
+          curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+          chmod +x /tmp/dotnet-install.sh
+          /tmp/dotnet-install.sh --channel 10.0 --architecture arm64 --install-dir "$HOME/.dotnet"
+          /tmp/dotnet-install.sh --channel 10.0 --runtime dotnet --architecture x64 --install-dir "$HOME/.dotnet-x64"
+
+          python3 -m venv "$CM_BUILD_DIR/.venv"
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+          pip install --no-cache-dir --upgrade pip
+          pip install --no-cache-dir \
+            uv lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow \
+            requests gdown "backports.zstd; python_version < '3.14'"
+
+      - name: 3. Clone mianmuhammadse/nxnative & Download Game Files
+        script: |
+          set -euo pipefail
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+
+          git clone --depth 1 https://github.com/mianmuhammadse/nxnative.git "$CM_BUILD_DIR/nxnative"
+          git clone --depth 1 https://github.com/ltsdw/gofile-downloader.git "$CM_BUILD_DIR/gf_dl"
+          find "$CM_BUILD_DIR/nxnative" \( -name "*.sh" -o -name "dmsh_xlate" -o -name "spirv-cross" -o -name "nx_extract" \) -exec chmod +x {} + || true
+
+          echo "=== Fail-fast check: Frostbite shader reader & FC 27 profile ==="
+          if [ ! -f "$CM_BUILD_DIR/nxnative/dm/gfx/tools/frostbite.py" ] || [ ! -d "$CM_BUILD_DIR/nxnative/dm/games/0100C49025D3E000" ]; then
+            echo "ERROR: mianmuhammadse/nxnative is missing dm/gfx/tools/frostbite.py or dm/games/0100C49025D3E000!"
+            exit 1
+          fi
+          ls -la "$CM_BUILD_DIR/nxnative/dm/gfx/tools/frostbite.py" "$CM_BUILD_DIR/nxnative/dm/games/0100C49025D3E000/"
+
+          GAME_DIR="$CM_BUILD_DIR/game_nsp"
+          KEYS_DIR="$CM_BUILD_DIR/keys"
+          mkdir -p "$GAME_DIR" "$KEYS_DIR"
+
+          download_url() {
+            local url="$1"
+            local out_dir="$2"
+            mkdir -p "$out_dir"
+            if [[ "$url" == *"gofile.io/d/"* ]]; then
+              echo "Downloading from Gofile via gofile-downloader.py..."
+              (cd "$CM_BUILD_DIR/gf_dl" && GF_DOWNLOAD_DIR="$out_dir" uv run gofile-downloader.py "$url")
+            elif [[ "$url" == *"drive.google.com"* ]]; then
+              echo "Downloading from Google Drive via gdown..."
+              gdown "$url" -O "$out_dir/"
+            else
+              echo "Downloading direct URL..."
+              local fname
+              fname=$(basename "${url%%\?*}")
+              [ -n "$fname" ] || fname="downloaded_file"
+              curl -fL --retry 3 "$url" -o "$out_dir/$fname"
+            fi
+          }
+
+          if [ -z "${BASE_URL:-}" ] || [ -z "${UPDATE_URL:-}" ] || [ -z "${KEYS_URL:-}" ]; then
+            echo "ERROR: BASE_URL, UPDATE_URL, and KEYS_URL must be set in group fc27_secrets."
+            exit 1
+          fi
+
+          echo "Downloading Base NSP..."
+          download_url "$BASE_URL" "$GAME_DIR"
+          echo "Downloading Update NSP..."
+          download_url "$UPDATE_URL" "$GAME_DIR"
+          echo "Downloading prod.keys..."
+          download_url "$KEYS_URL" "$KEYS_DIR"
+
+          if [ -n "${DLC_URL:-}" ]; then
+            echo "Downloading optional DLC..."
+            download_url "$DLC_URL" "$GAME_DIR"
+          fi
+
+          find "$GAME_DIR" -mindepth 2 -type f \( -iname "*.nsp" -o -iname "*.nsz" -o -iname "*.xci" \) -exec mv -f {} "$GAME_DIR/" \;
+
+          KEY_FILE=$(find "$KEYS_DIR" -type f ! -name ".*" | head -n 1)
+          if [ -z "$KEY_FILE" ]; then
+            echo "ERROR: prod.keys not found after download!"
+            exit 1
+          fi
+          if [ "$KEY_FILE" != "$KEYS_DIR/prod.keys" ]; then
+            cp -f "$KEY_FILE" "$KEYS_DIR/prod.keys"
+          fi
+
+          ls -lh "$GAME_DIR"
+          df -h /
+
+      - name: 4. Inject Credit UI & Build FC 27 iOS IPA + Separate RomFS
         script: |
           set -euo pipefail
           source "$CM_BUILD_DIR/.venv/bin/activate"
@@ -173,22 +147,110 @@ workflows:
           GAME_DIR="$CM_BUILD_DIR/game_nsp"
           KEYS_FILE="$CM_BUILD_DIR/keys/prod.keys"
           LOG_DIR="$GAME_DIR/0100C49025D3E000_build/logs"
-          cd "$CM_BUILD_DIR/NX2Apple-FC27"
+          cd "$CM_BUILD_DIR/nxnative"
 
           trap 'echo "=== ERROR LOGS ==="; for lf in "$LOG_DIR"/*.log; do [ -f "$lf" ] && echo "--- $lf ---" && tail -n 120 "$lf"; done' ERR
 
-          if [ -z "${CAPTURE_URL:-}" ] && [ -f "dm/games/0100C49025D3E000/nvn_capture.tsv" ]; then
-            echo "CAPTURE_URL is empty -> skipping runtime NVN capture to build with static shaders."
-            mv -f "dm/games/0100C49025D3E000/nvn_capture.tsv" "dm/games/0100C49025D3E000/nvn_capture.tsv.disabled"
-          fi
+          # Inject "Port by Miaomiaocutene" + custom SwiftUI cat icon into Launcher.swift
+          python3 - << 'PYEOF'
+          import os, re, subprocess, shutil
+
+          candidates = [
+              "dm/ios/Sources/Launcher.swift",
+              "src/dm/ios/Sources/Launcher.swift",
+          ]
+          target = next((p for p in candidates if os.path.isfile(p)), None)
+          if not target:
+              print("WARNING: Launcher.swift not found, skipping Launcher UI credit patch.")
+              raise SystemExit(0)
+
+          orig = open(target, "r", encoding="utf-8").read()
+          if "Port by Miaomiaocutene" in orig:
+              print("Launcher.swift already contains credit.")
+              raise SystemExit(0)
+
+          credit_defs = """
+          private struct MiaoCatIcon: Shape {
+              func path(in rect: CGRect) -> Path {
+                  var p = Path()
+                  let w = rect.width, h = rect.height
+                  p.move(to: CGPoint(x: w * 0.16, y: h * 0.42))
+                  p.addLine(to: CGPoint(x: w * 0.22, y: h * 0.12))
+                  p.addLine(to: CGPoint(x: w * 0.40, y: h * 0.30))
+                  p.addQuadCurve(to: CGPoint(x: w * 0.60, y: h * 0.30), control: CGPoint(x: w * 0.50, y: h * 0.26))
+                  p.addLine(to: CGPoint(x: w * 0.78, y: h * 0.12))
+                  p.addLine(to: CGPoint(x: w * 0.84, y: h * 0.42))
+                  p.addQuadCurve(to: CGPoint(x: w * 0.50, y: h * 0.88), control: CGPoint(x: w * 0.88, y: h * 0.82))
+                  p.addQuadCurve(to: CGPoint(x: w * 0.16, y: h * 0.42), control: CGPoint(x: w * 0.12, y: h * 0.82))
+                  p.closeSubpath()
+                  return p
+              }
+          }
+
+          private struct MiaoCreditRow: View {
+              var body: some View {
+                  HStack(spacing: 6) {
+                      MiaoCatIcon()
+                          .fill(Color(red: 1.0, green: 0.45, blue: 0.72))
+                          .frame(width: 16, height: 16)
+                      Text("Port by Miaomiaocutene")
+                          .font(.footnote.weight(.semibold))
+                          .foregroundStyle(.secondary)
+                  }
+                  .frame(maxWidth: .infinity, alignment: .center)
+                  .padding(.vertical, 4)
+              }
+          }
+          """
+
+          # Insert MiaoCreditRow() inside the first Form/List/VStack body in Launcher.swift
+          patched = None
+          for pat in [r'(Form\s*\{)', r'(List\s*\{)', r'(VStack(?:\([^)]*\))?\s*\{)']:
+              m = re.search(pat, orig)
+              if m:
+                  idx = m.end()
+                  patched = orig[:idx] + "\n            MiaoCreditRow()\n" + orig[idx:] + "\n" + credit_defs
+                  break
+
+          if not patched:
+              print("WARNING: Could not find Form/List/VStack in Launcher.swift, skipping.")
+              raise SystemExit(0)
+
+          backup = target + ".bak"
+          shutil.copy2(target, backup)
+          open(target, "w", encoding="utf-8").write(patched)
+
+          # Syntax-verify with swiftc -parse so we never break the build
+          res = subprocess.run(["xcrun", "swiftc", "-parse", target], capture_output=True, text=True)
+          if res.returncode != 0:
+              print("WARNING: swiftc -parse failed after credit patch, reverting Launcher.swift:", res.stderr)
+              shutil.move(backup, target)
+          else:
+              os.remove(backup)
+              print("Successfully patched Launcher.swift with MiaoCreditRow + MiaoCatIcon!")
+          PYEOF
+
+          # Create iOS entitlements with increased memory limit + extended virtual addressing
+          cat << 'EOF' > "$CM_BUILD_DIR/ios_entitlements.plist"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.developer.kernel.increased-memory-limit</key>
+            <true/>
+            <key>com.apple.developer.kernel.extended-virtual-addressing</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
 
           LANG_ARGS=()
           if [ "${GAME_LANG:-en}" != "en" ]; then
             LANG_ARGS=(-l "$GAME_LANG")
           fi
 
-          DM_ENTITLEMENTS=ios_entitlements.plist \
-            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform ios -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
+          DM_ENTITLEMENTS="$CM_BUILD_DIR/ios_entitlements.plist" \
+            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform ios --romfs separate -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
 
           IPA_PATH=$(find "$GAME_DIR" -maxdepth 2 -name "*.ipa" | head -n 1)
           if [ -z "$IPA_PATH" ]; then
@@ -196,6 +258,7 @@ workflows:
             exit 1
           fi
 
+          # Also inject credit into Info.plist
           WORK_IPA="$CM_BUILD_DIR/ipa_credit"
           mkdir -p "$WORK_IPA"
           unzip -qo "$IPA_PATH" -d "$WORK_IPA"
@@ -208,181 +271,38 @@ workflows:
           (cd "$WORK_IPA" && zip -qry "$IPA_PATH" Payload)
           rm -rf "$WORK_IPA"
 
-          ls -lh "$IPA_PATH"
-          if [ -d "$GAME_DIR/romfs" ]; then
-            du -sh "$GAME_DIR/romfs"
-          fi
-
-      - name: 5. Upload IPA & RomFS Folder to Gofile
-        script: |
-          set -euo pipefail
-          source "$CM_BUILD_DIR/.venv/bin/activate"
-
-          GAME_DIR="$CM_BUILD_DIR/game_nsp"
-          IPA_PATH=$(find "$GAME_DIR" -maxdepth 2 -name "*.ipa" | head -n 1)
-
-          python3 - "$IPA_PATH" "$GAME_DIR/romfs" << 'EOF'
-          import os, sys, glob, requests
-
-          ipa_path = sys.argv[1]
-          romfs_dir = sys.argv[2]
-
-          server = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
-          upload_url = f"https://{server}.gofile.io/contents/uploadfile"
-
-          def upload_file(path, folder_id=None, token=None):
-              size_mb = os.path.getsize(path) / (1024 * 1024)
-              print(f"Uploading {os.path.basename(path)} ({size_mb:.1f} MB)...")
-              data = {}
-              if folder_id:
-                  data["folderId"] = folder_id
-              if token:
-                  data["token"] = token
-              with open(path, "rb") as f:
-                  r = requests.post(upload_url, data=data, files={"file": (os.path.basename(path), f)}, timeout=1800)
-              r.raise_for_status()
-              j = r.json()
-              if j.get("status") != "ok":
-                  raise RuntimeError(f"Gofile upload failed: {j}")
-              return j["data"]
-
-          first = upload_file(ipa_path)
-          folder_id = first["parentFolder"]
-          token = first.get("guestToken")
-          download_page = first["downloadPage"]
-          print(f"\n==========================================")
-          print(f"GOFILE DOWNLOAD PAGE: {download_page}")
-          print(f"==========================================\n")
-
-          if os.path.isdir(romfs_dir):
-              for fp in sorted(glob.glob(os.path.join(romfs_dir, "*"))):
-                  if os.path.isfile(fp):
-                      upload_file(fp, folder_id=folder_id, token=token)
-
-          print(f"\nALL DONE! Download everything from: {download_page}")
-          EOF
-
-  # =====================================================================
-  # WORKFLOW 2: Build Mac App + 1-Click Shader Capture Kit for a Mac Friend
-  # Produces EA SPORTS FC 27.app + Run_FC27_Capture.command split into 4 GB
-  # parts on Gofile so a friend on Apple Silicon Mac can capture all 609
-  # shaders without installing Xcode/Homebrew/Python/.NET.
-  # =====================================================================
-  build-fc27-mac-kit:
-    name: 2. FC 27 Build Mac App + Capture Kit (Gofile)
-    instance_type: mac_mini_m2
-    max_build_duration: 120
-    environment: *common_env
-    scripts:
-      - *script_cleanup
-      - *script_tools
-      - *script_clone_and_download
-
-      - name: 4. Build Mac App & Generate 1-Click Capture Kit
-        script: |
-          set -euo pipefail
-          source "$CM_BUILD_DIR/.venv/bin/activate"
-          export DOTNET_ROOT="$HOME/.dotnet"
-          export DOTNET_ROOT_ARM64="$HOME/.dotnet"
-          export DOTNET_ROOT_X64="$HOME/.dotnet-x64"
-          export DOTNET_ROLL_FORWARD=Major
-          export PATH="$HOME/.dotnet:$PATH"
-
-          GAME_DIR="$CM_BUILD_DIR/game_nsp"
-          KEYS_FILE="$CM_BUILD_DIR/keys/prod.keys"
-          LOG_DIR="$GAME_DIR/0100C49025D3E000_build/logs"
-          cd "$CM_BUILD_DIR/NX2Apple-FC27"
-
-          trap 'echo "=== ERROR LOGS ==="; for lf in "$LOG_DIR"/*.log; do [ -f "$lf" ] && echo "--- $lf ---" && tail -n 120 "$lf"; done' ERR
-
-          if [ -f "dm/games/0100C49025D3E000/nvn_capture.tsv" ]; then
-            cp -f "dm/games/0100C49025D3E000/nvn_capture.tsv" "$CM_BUILD_DIR/nvn_capture.tsv"
-            mv -f "dm/games/0100C49025D3E000/nvn_capture.tsv" "dm/games/0100C49025D3E000/nvn_capture.tsv.disabled"
-          fi
-
-          LANG_ARGS=()
-          if [ "${GAME_LANG:-en}" != "en" ]; then
-            LANG_ARGS=(-l "$GAME_LANG")
-          fi
-
-          python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform mac-app -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
-
-          APP_PATH=$(find "$GAME_DIR" -maxdepth 2 -name "*.app" -type d | head -n 1)
-          if [ -z "$APP_PATH" ]; then
-            echo "ERROR: No .app generated!"
-            exit 1
-          fi
-          APP_NAME=$(basename "$APP_PATH")
-
-          CAP_ENV=$(python3 - << 'PYEOF'
-          import re
-          src = open("scripts/nvn_capture_play.py", "r", encoding="utf-8", errors="ignore").read()
-          m = re.findall(r'DM_[A-Z0-9_]*CAP[A-Z0-9_]*|DM_[A-Z0-9_]*SHADER[A-Z0-9_]*|DM_[A-Z0-9_]*DUMP[A-Z0-9_]*', src)
-          print(m[0] if m else "DM_NVN_SHADER_CAPTURE")
-          PYEOF
-          )
-          echo "Detected shader capture env var from nvn_capture_play.py: $CAP_ENV"
-
-          KIT_DIR="$CM_BUILD_DIR/FC27_Mac_Kit"
-          mkdir -p "$KIT_DIR"
-          mv -f "$APP_PATH" "$KIT_DIR/$APP_NAME"
-          [ -f "$CM_BUILD_DIR/nvn_capture.tsv" ] && cp -f "$CM_BUILD_DIR/nvn_capture.tsv" "$KIT_DIR/nvn_capture.tsv"
-          rm -rf "$GAME_DIR"
-
-          cat << EOF > "$KIT_DIR/Run_FC27_Capture.command"
-          #!/bin/bash
-          set -e
-          DIR="\$(cd "\$(dirname "\$0")" && pwd)"
-          APP="\$DIR/$APP_NAME"
-          OUT="\$HOME/Desktop/fc27_nvn_capture"
-          mkdir -p "\$OUT"
-
-          echo "Removing macOS quarantine..."
-          xattr -dr com.apple.quarantine "\$APP" 2>/dev/null || true
-
-          BIN=\$(find "\$APP/Contents/MacOS" -type f -perm +111 | head -n 1)
-          echo "Launching FC 27 with $CAP_ENV=\$OUT"
-          echo "Play through: Main Menu -> Manager Career (cutscenes, squad, contracts) -> Player Career -> 1 Full Match."
-          echo "Close the game window when finished to auto-create nvn_capture.zip on your Desktop!"
-          $CAP_ENV="\$OUT" "\$BIN" || true
-
-          echo ""
-          echo "Captured files: \$(ls -1 "\$OUT" | wc -l)"
-          (cd "\$HOME/Desktop" && zip -qry "\$HOME/Desktop/nvn_capture.zip" "fc27_nvn_capture")
-          echo "DONE! Please send \$HOME/Desktop/nvn_capture.zip back!"
-          read -p "Press Enter to close..."
-          EOF
-          chmod +x "$KIT_DIR/Run_FC27_Capture.command"
-
-          OUT_DIR="$CM_BUILD_DIR/mac_kit_upload"
-          mkdir -p "$OUT_DIR"
-          (cd "$CM_BUILD_DIR" && tar -cf - "FC27_Mac_Kit" | split -b 4000m - "$OUT_DIR/FC27_Mac_Kit.tar.part_")
-          rm -rf "$KIT_DIR"
-
-          cat << 'EOF' > "$OUT_DIR/1_Unpack_FC27_Mac.command"
-          #!/bin/bash
-          set -e
-          DIR="$(cd "$(dirname "$0")" && pwd)"
-          echo "Unpacking FC27_Mac_Kit from split parts..."
-          cat "$DIR"/FC27_Mac_Kit.tar.part_* | tar -xf - -C "$DIR"
-          echo "DONE! Open the FC27_Mac_Kit folder and double-click Run_FC27_Capture.command."
-          read -p "Press Enter to close..."
-          EOF
-          chmod +x "$OUT_DIR/1_Unpack_FC27_Mac.command"
-
-          ls -lh "$OUT_DIR"
+          echo "=== Build outputs ==="
+          ls -lh "$GAME_DIR"
           df -h /
 
-      - name: 5. Upload Mac Capture Kit Parts to Gofile
+      - name: 5. Upload IPA & RomFS Outputs to Gofile
         script: |
           set -euo pipefail
           source "$CM_BUILD_DIR/.venv/bin/activate"
 
-          python3 - "$CM_BUILD_DIR/mac_kit_upload" << 'EOF'
+          GAME_DIR="$CM_BUILD_DIR/game_nsp"
+
+          python3 - "$GAME_DIR" << 'EOF'
           import os, sys, glob, requests
 
-          out_dir = sys.argv[1]
-          files = sorted(glob.glob(os.path.join(out_dir, "*")))
+          game_dir = sys.argv[1]
+          to_upload = []
+
+          for p in sorted(glob.glob(os.path.join(game_dir, "*.ipa"))):
+              if os.path.isfile(p):
+                  to_upload.append(p)
+          for p in sorted(glob.glob(os.path.join(game_dir, "*.img"))):
+              if os.path.isfile(p):
+                  to_upload.append(p)
+          romfs_dir = os.path.join(game_dir, "romfs")
+          if os.path.isdir(romfs_dir):
+              for p in sorted(glob.glob(os.path.join(romfs_dir, "*"))):
+                  if os.path.isfile(p):
+                      to_upload.append(p)
+
+          if not to_upload:
+              raise RuntimeError(f"No IPA or RomFS files found in {game_dir}")
+
           server = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
           upload_url = f"https://{server}.gofile.io/contents/uploadfile"
 
@@ -390,9 +310,7 @@ workflows:
           token = None
           download_page = None
 
-          for fp in files:
-              if not os.path.isfile(fp):
-                  continue
+          for fp in to_upload:
               size_mb = os.path.getsize(fp) / (1024 * 1024)
               print(f"Uploading {os.path.basename(fp)} ({size_mb:.1f} MB)...")
               data = {}
@@ -412,8 +330,8 @@ workflows:
                   token = res.get("guestToken")
                   download_page = res["downloadPage"]
                   print(f"\n==========================================")
-                  print(f"MAC KIT GOFILE LINK: {download_page}")
+                  print(f"GOFILE DOWNLOAD PAGE: {download_page}")
                   print(f"==========================================\n")
 
-          print(f"\nALL DONE! Share this Gofile link with your Mac friend: {download_page}")
+          print(f"\nALL DONE! Download everything from: {download_page}")
           EOF
